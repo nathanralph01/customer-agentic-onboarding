@@ -14,7 +14,20 @@ Set-Location backend
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
 ```
 
-The demo onboarding flow stores a synthetic customer and user profile,
+Each new onboarding chat creates a distinct customer and anonymous applicant
+record. The applicant satisfies the existing required `created_by` reference;
+its generated `.invalid` email is a placeholder, not a contact address or login.
+Retries use stable IDs derived from the chat UUID. Resuming a chat uses its
+stored customer ID. Login remains a demo entry point; the selected demo persona scopes conversation history and submitted applications.
+The persona picker is unauthenticated and intended for sandbox data.
+Existing chats keep their original links. Saved answers
+update `customers.legal_name`, `business_activity`, `registration_location`, and
+`ownership_description`; the onboarding application stores these named fields
+plus `banking_needs` and the original answers. Compound free-text responses are
+not guessed into structured `owners`, `industry`, `address` or product codes.
+These additional string fields are permitted by the existing collection validators.
+
+The demo also stores
 onboardings, conversations, messages, document metadata and document content in
 Atlas. File content uses GridFS; the `fs.files` and `fs.chunks` collections are
 created automatically on the first upload if absent. MCP writes BSON binary
