@@ -25,9 +25,9 @@ class ProfileTests(unittest.IsolatedAsyncioTestCase):
     async def test_answers_update_profile_and_application_without_guessing(self):
         db = {name: AsyncMock() for name in ("customers", "messages", "onboardings", "conversations")}
         answers = ["MDPL Company", "Software services", "Ontario, Canada", "Alex owns 100%", "Business account"]
-        db["messages"].find_one.return_value = {"content": answers[-1]}
+        db["onboardings"].find_one.return_value = {"status": "DRAFT"}
         customer_id = ObjectId()
-        conversation = {"_id": ObjectId(), "onboarding_id": ObjectId()}
+        conversation = {"_id": ObjectId(), "onboarding_id": ObjectId(), "owner_customer_id": ObjectId()}
         with patch("app.main._read_answers", AsyncMock(return_value=answers)):
             await _save_answer(db, conversation, customer_id, 4, answers[-1])
         profile = db["customers"].update_one.call_args.args[1]["$set"]

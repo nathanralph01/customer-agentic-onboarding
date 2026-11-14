@@ -56,6 +56,11 @@ class MCPDatabase:
     def __getitem__(self, collection):
         return MCPCollection(self, collection)
 
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return self[name]
+
     async def call(self, name, collection, **arguments):
         try:
             return await tool(self.session, name, {
@@ -97,7 +102,8 @@ class MCPCollection:
             last_id = next_id
         if sort:
             key, direction = sort
-            documents.sort(key=lambda document: document[key], reverse=direction < 0)
+            documents.sort(key=lambda document: (document.get(key) is not None, document.get(key)),
+                           reverse=direction < 0)
         return documents
 
     async def find_one(self, query):
@@ -132,11 +138,14 @@ class MCPCollection:
         return SimpleNamespace(inserted_id=document["_id"])
 
     async def update_one(self, query, update):
+        # An exact ID guarantees at most one match, including with extra predicates.
+        if isinstance(query.get("_id"), (ObjectId, str)):
+            return await self.database.call("update-many", self.name, filter=query, update=update)
         # Resolve exactly one _id because MCP exposes update-many, not update-one.
         existing = await self.find_one(query)
         if existing is not None:
             return await self.database.call("update-many", self.name,
-                                            filter={"_id": existing["_id"]}, update=update)
+                                            filter={**query, "_id": existing["_id"]}, update=update)
 
     async def delete_one(self, query):
         existing = await self.find_one(query)

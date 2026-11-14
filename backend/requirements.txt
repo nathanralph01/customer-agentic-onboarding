@@ -6,3 +6,4 @@ pymongo>=4.10,<5
 python-dotenv>=1.0,<2
 python-multipart>=0.0.20,<1
 mcp>=1.28,<2
+langchain>=1,<2

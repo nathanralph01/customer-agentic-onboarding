@@ -2,42 +2,36 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import { ArrowLeft, Bot, Check, Download, History, MessageSquare, Plus, Send, FileText, Upload, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import CustomerLayout from '@/components/CustomerLayout'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import {
   createConversation,
   downloadDocument,
   listConversations,
   listDocuments,
-  saveConversationAnswer,
+  ApiError,
+  sendChatMessage,
   removeDocument as deleteDocument,
   uploadDocument,
+  type ChatMessage,
   type Conversation,
+  type ConversationDraft,
   type OnboardingDocument,
 } from '@/lib/api'
 
-const QUESTIONS = [
-  'What is the legal name of your business?',
-  'What does your business do, and which industry does it operate in?',
-  'Where is your business registered? Please include the country and province or state.',
-  'Who owns your business? Please list the owners and their ownership percentages.',
-  'Which banking products are you interested in? For example, a business account, payments or a credit facility.',
-]
-const FIELDS = ['Business name', 'Business activity', 'Registration location', 'Business owners', 'Banking products']
-const WELCOME = 'Hi, I’m your onboarding guide. I’ll help you gather your business details, one question at a time. Let’s get started. '
 type Tab = 'chat' | 'info' | 'history'
 const STORAGE_KEY = 'customer360-onboarding-conversations'
 
-function newConversation(): Conversation {
+function newConversation(): ConversationDraft {
   return { id: crypto.randomUUID(), startedAt: new Date().toISOString(), answers: [] }
 }
 
-function loadConversations(): Conversation[] {
+function loadConversations(): ConversationDraft[] {
   try {
     const saved: unknown = JSON.parse(sessionStorage.getItem(STORAGE_KEY) || '[]')
-    if (Array.isArray(saved)) return saved.filter((item): item is Conversation =>
+    if (Array.isArray(saved)) return saved.filter((item): item is ConversationDraft =>
       item && typeof item.id === 'string' && typeof item.startedAt === 'string' &&
       !Number.isNaN(Date.parse(item.startedAt)) &&
-      Array.isArray(item.answers) && item.answers.length <= QUESTIONS.length &&
+      Array.isArray(item.answers) && item.answers.length <= 5 &&
       item.answers.every((answer: unknown) => typeof answer === 'string'))
   } catch { /* Start a fresh demo if tab storage is unavailable or invalid. */ }
   return []
@@ -55,11 +49,13 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   const [documents, setDocuments] = useState<Record<string, OnboardingDocument[]>>({})
   const [documentBusy, setDocumentBusy] = useState(false)
   const [documentError, setDocumentError] = useState('')
+  const [documentLoadAttempt, setDocumentLoadAttempt] = useState(0)
   const [dragging, setDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const initialConversation = useRef<Conversation | null>(null)
+  const initialConversation = useRef<ConversationDraft | null>(null)
+  const pendingMessage = useRef<{ conversationId: string; message: ChatMessage } | null>(null)
   const active = conversations.find(item => item.id === activeId) || conversations[0]
 
   useEffect(() => {
@@ -76,16 +72,15 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
             sessionStorage.removeItem(STORAGE_KEY)
           }
         }
-        if (!saved.length) {
+        let ongoing = saved.find(item => !item.applicationId && item.answers.length < item.fields.length)
+        if (!ongoing && !cancelled) {
           initialConversation.current ??= newConversation()
-          saved = [await createConversation(initialConversation.current)]
+          ongoing = await createConversation(initialConversation.current)
+          saved = [ongoing, ...saved.filter(item => item.id !== ongoing?.id)]
         }
-        const savedDocuments = await Promise.all(saved.map(async conversation =>
-          [conversation.id, await listDocuments(conversation.id)] as const))
         if (!cancelled) {
           setConversations(saved)
-          setActiveId(saved[0].id)
-          setDocuments(Object.fromEntries(savedDocuments))
+          setActiveId(ongoing?.id ?? null)
         }
       } catch (error) {
         if (!cancelled) {
@@ -99,35 +94,56 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
     return () => { cancelled = true }
   }, [loadAttempt])
 
-  const activeDocuments = active ? documents[active.id] || [] : []
-  const complete = active?.answers.length === QUESTIONS.length
-  const activeAnswerCount = active?.answers.length ?? 0
+  const documentConversationId = tab === 'info' ? active?.id : undefined
+  const documentsLoaded = documentConversationId !== undefined && documents[documentConversationId] !== undefined
 
-  function saveConversations(next: Conversation[]) { setConversations(next) }
+  useEffect(() => {
+    if (!documentConversationId || documentsLoaded) return
+    let cancelled = false
+    listDocuments(documentConversationId).then(items => {
+      if (!cancelled) setDocuments(current => ({ ...current, [documentConversationId]: items }))
+    }).catch(error => {
+      if (!cancelled) setDocumentError(error instanceof Error ? error.message : 'Unable to load documents.')
+    })
+    return () => { cancelled = true }
+  }, [documentConversationId, documentsLoaded, documentLoadAttempt])
+
+  const activeDocuments = active ? documents[active.id] || [] : []
+  const complete = active && active.answers.length === active.fields.length
 
   useEffect(() => {
     const log = logRef.current
     if (log && tab === 'chat' && activeId !== null) log.scrollTop = log.scrollHeight
-  }, [activeAnswerCount, activeId, tab])
-
-  function updateActive(update: Partial<Conversation>) {
-    if (!active) return
-    saveConversations(conversations.map(item => item.id === active.id ? { ...item, ...update } : item))
-  }
+  }, [active?.revision, activeId, tab])
 
   async function send(event?: FormEvent) {
     event?.preventDefault()
-    if (!active || !draft.trim() || complete || saving) return
-    const answer = draft.trim()
+    if (!active || !draft.trim() || active.applicationId || complete || saving) return
+    const content = draft.trim()
+    const pending = pendingMessage.current
+    const message = pending?.conversationId === active.id && pending.message.content === content
+      ? pending.message
+      : { id: crypto.randomUUID(), revision: active.revision, sequence: active.answers.length, content }
+    pendingMessage.current = { conversationId: active.id, message }
     setSaving(true)
     setApiError('')
     try {
-      const saved = await saveConversationAnswer(active.id, active.answers.length, answer)
-      updateActive(saved)
+      const saved = await sendChatMessage(active.id, message)
+      setConversations(current => current.map(item => item.id === saved.id ? saved : item))
+      pendingMessage.current = null
       setDraft('')
       inputRef.current?.focus()
     } catch (error) {
-      setApiError(error instanceof Error ? error.message : 'Unable to save your answer in Atlas.')
+      setApiError(error instanceof Error ? error.message : 'Unable to send your message.')
+      if (error instanceof ApiError && error.status === 409) {
+        pendingMessage.current = null
+        try {
+          const latest = (await listConversations()).find(item => item.id === active.id)
+          if (latest) setConversations(current => current.map(item => item.id === latest.id ? latest : item))
+        } catch {
+          setApiError('Unable to reload the conversation. Refresh the page and try again.')
+        }
+      }
     } finally {
       setSaving(false)
     }
@@ -146,7 +162,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
     setApiError('')
     try {
       const saved = await createConversation(next)
-      saveConversations([saved, ...conversations])
+      setConversations(current => [saved, ...current])
       setActiveId(saved.id)
       setDocumentError('')
       setDraft('')
@@ -159,7 +175,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   }
 
   async function addDocuments(files: FileList | null) {
-    if (!files || !active || documentBusy) return
+    if (!files || !active || !documentsLoaded || documentBusy) return
     const accepted: File[] = []
     const errors: string[] = []
     for (const file of Array.from(files)) {
@@ -265,25 +281,26 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
         </div>
 
         <section role="tabpanel" id="panel-chat" aria-labelledby="tab-chat" hidden={tab !== 'chat'} className={tab === 'chat' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}>
-          <div className="flex shrink-0 items-center justify-between gap-3 border-b px-5 py-3">
+          <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
             <div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-xl bg-accent text-primary"><Bot className="size-5" aria-hidden="true" /></span><div><h2 className="text-sm font-semibold">Your onboarding guide</h2><p className="text-xs text-muted-foreground">Business details · Owners · Banking needs</p></div></div>
-            <p className="text-xs font-medium text-muted-foreground">{active.answers.length} of {QUESTIONS.length} questions answered</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-xs font-medium text-muted-foreground">{active.answers.length} of {active.fields.length} questions answered</p>
+              <Button type="button" variant="outline" size="sm" onClick={startNew} disabled={saving}>
+                <Plus aria-hidden="true" />Start new conversation
+              </Button>
+            </div>
           </div>
           <div ref={logRef} role="log" aria-label="Onboarding conversation" aria-live="polite" className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-5 py-4">
-            <BotMessage>{WELCOME}{QUESTIONS[0]}</BotMessage>
-            {active.answers.map((answer, index) => <div key={`${active.id}-${index}`} className="space-y-4">
-              <div className="ml-auto max-w-[85%] rounded-2xl rounded-tr-sm bg-primary px-4 py-3 text-sm leading-6 whitespace-pre-wrap break-words text-primary-foreground"><span className="sr-only">You: </span>{answer}</div>
-              <BotMessage>{index + 1 < QUESTIONS.length ? `Thank you. ${QUESTIONS[index + 1]}` : 'Thanks, you’ve gathered the key details! You can review your answers below or attach company documents in the Company documents tab. This demo has not submitted an application or started verification.'}</BotMessage>
-            </div>)}
-            {complete && <div className="rounded-xl border bg-muted/40 p-5"><h3 className="flex items-center gap-2 font-semibold"><Check className="size-4 text-primary" aria-hidden="true" />Your business details</h3><dl className="mt-4 space-y-3">{active.answers.map((answer, index) => <div key={FIELDS[index]}><dt className="text-xs font-medium text-muted-foreground">{FIELDS[index]}</dt><dd className="mt-1 text-sm whitespace-pre-wrap break-words">{answer}</dd></div>)}</dl></div>}
+            <OnboardingTranscript conversation={active} />
+            {complete && <div className="rounded-xl border bg-muted/40 p-5"><h3 className="flex items-center gap-2 font-semibold"><Check className="size-4 text-primary" aria-hidden="true" />Your business details</h3><dl className="mt-4 space-y-3">{active.answers.map((answer, index) => <div key={active.fields[index]}><dt className="text-xs font-medium text-muted-foreground">{active.fields[index]}</dt><dd className="mt-1 text-sm whitespace-pre-wrap break-words">{answer}</dd></div>)}</dl></div>}
           </div>
           <div className="shrink-0 border-t bg-muted/20 px-5 py-3">
-            {complete ? <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-muted-foreground">Your draft conversation is ready to review.</p><Button variant="outline" onClick={() => setTab('info')}>Add company documents</Button></div> : <form onSubmit={send} className="flex items-end gap-3 rounded-xl border bg-card p-2 focus-within:ring-2 focus-within:ring-ring">
-              <label htmlFor="chat-answer" className="sr-only">{QUESTIONS[active.answers.length]}</label>
-              <textarea ref={inputRef} id="chat-answer" rows={1} maxLength={4000} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={handleKeyDown} placeholder="Type your answer…" className="min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm outline-none" />
-              <Button type="submit" disabled={!draft.trim() || saving} aria-label="Send answer" className="mb-1"><Send aria-hidden="true" /><span className="hidden sm:inline">Send</span></Button>
+            {active.applicationId ? <Link className={buttonVariants()} to={`/customer/cases/${active.applicationId}`}>Track submitted application</Link> : complete ? <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-muted-foreground">Your draft conversation is ready to review.</p><Link className={buttonVariants()} to="/customer/apply" state={{ answers: active.answers, conversationId: active.id }}>Review application</Link><Button variant="outline" onClick={() => setTab('info')}>Add company documents</Button></div> : <form onSubmit={send} className="flex items-end gap-3 rounded-xl border bg-card p-2 focus-within:ring-2 focus-within:ring-ring">
+              <label htmlFor="chat-answer" className="sr-only">{active.fields[active.answers.length]}</label>
+              <textarea ref={inputRef} id="chat-answer" rows={1} maxLength={4000} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={handleKeyDown} placeholder="Type your answer…" readOnly={saving} className="min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm outline-none" />
+              <Button type="submit" disabled={!draft.trim() || saving} aria-label="Send answer" className="mb-1"><Send aria-hidden="true" /><span className="hidden sm:inline">{saving ? 'Sending…' : 'Send'}</span></Button>
             </form>}
-            <p className="mt-2 text-xs text-muted-foreground">Scripted demo · Use synthetic business details only · Saved in Atlas</p>
+            <p className="mt-2 text-xs text-muted-foreground">{active.agentEnabled ? 'Agent-assisted intake' : 'Guided intake'} · Use synthetic business details only · Saved in Atlas</p>
           </div>
         </section>
 
@@ -297,10 +314,13 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
             <p className="mt-2 text-sm font-medium">Drop company documents here</p>
             <p id="document-types" className="mt-1 text-xs text-muted-foreground">PDF, DOCX, TXT, CSV, PNG or JPG · Up to 10 MB per file</p>
             <input ref={fileInputRef} type="file" multiple accept=".pdf,.docx,.txt,.csv,.png,.jpg,.jpeg" aria-label="Choose company documents" aria-describedby="document-types" className="hidden" onChange={event => { addDocuments(event.target.files); event.target.value = '' }} />
-            <Button variant="outline" className="mt-3" disabled={documentBusy || activeDocuments.length >= 10} onClick={() => fileInputRef.current?.click()}>{documentBusy ? 'Saving…' : 'Choose files'}</Button>
+            <Button variant="outline" className="mt-3" disabled={!documentsLoaded || documentBusy || activeDocuments.length >= 10} onClick={() => fileInputRef.current?.click()}>{documentBusy ? 'Saving…' : 'Choose files'}</Button>
           </div>
-          {documentError && <p role="alert" className="mt-3 text-sm text-destructive">{documentError}</p>}
-          <p className="mt-3 text-xs text-muted-foreground">Documents are stored in Atlas and can be downloaded or removed. The scripted assistant does not read them yet. Use synthetic documents only.</p>
+          {documentError && <div className="mt-3">
+            <p role="alert" className="text-sm text-destructive">{documentError}</p>
+            {!documentsLoaded && <Button variant="outline" size="sm" onClick={() => { setDocumentError(''); setDocumentLoadAttempt(attempt => attempt + 1) }}>Retry documents</Button>}
+          </div>}
+          <p className="mt-3 text-xs text-muted-foreground">Documents are stored in Atlas and can be downloaded or removed. Document review is outside this intake step. Use synthetic documents only.</p>
           <div className="mt-5">
             <h3 className="text-sm font-semibold">Attached to this conversation</h3>
             {activeDocuments.length ? <ul className="mt-2 divide-y rounded-xl border" aria-label="Attached company documents">{activeDocuments.map(document => <li key={document.id} className="flex items-center gap-3 px-4 py-3">
@@ -308,13 +328,13 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
               <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium" title={document.filename}>{document.filename}</p><p className="mt-1 text-xs text-muted-foreground">{document.sizeBytes < 1024 * 1024 ? `${Math.ceil(document.sizeBytes / 1024)} KB` : `${(document.sizeBytes / (1024 * 1024)).toFixed(1)} MB`} · Stored in Atlas</p></div>
               <Button variant="ghost" aria-label={`Download ${document.filename}`} disabled={documentBusy} onClick={() => downloadStoredDocument(document)}><Download aria-hidden="true" /></Button>
               <Button variant="ghost" aria-label={`Remove ${document.filename}`} disabled={documentBusy} onClick={() => removeStoredDocument(document)}><X aria-hidden="true" /></Button>
-            </li>)}</ul> : <p className="mt-2 text-sm text-muted-foreground">No documents added yet.</p>}
+            </li>)}</ul> : <p role="status" className="mt-2 text-sm text-muted-foreground">{documentsLoaded ? 'No documents added yet.' : documentError ? 'Documents unavailable.' : 'Loading documents…'}</p>}
           </div>
         </section>
 
         <section role="tabpanel" id="panel-history" aria-labelledby="tab-history" hidden={tab !== 'history'} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5">
-          <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">Your conversations</h2><p className="mt-2 text-sm text-muted-foreground">Revisit or continue a conversation saved in Atlas.</p></div><Button onClick={startNew} disabled={saving}><Plus aria-hidden="true" />New conversation</Button></div>
-          <ul className="mt-6 space-y-3">{conversations.map(item => <li key={item.id}><button type="button" onClick={() => { setActiveId(item.id); setDocumentError(''); setDraft(''); setTab('chat') }} className="flex w-full flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-left outline-none hover:border-primary/40 hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-ring"><div className="min-w-0"><p className="font-medium break-words">{item.answers[0] || 'New business onboarding'}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.startedAt).toLocaleString()} · {item.answers.length} of {QUESTIONS.length} questions answered</p></div><span className="rounded-full bg-secondary px-3 py-1 text-xs font-medium text-secondary-foreground">{item.id === active.id ? 'Current' : item.answers.length === QUESTIONS.length ? 'Draft complete' : 'In progress'}</span></button></li>)}</ul>
+          <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">Your conversations</h2><p className="mt-2 text-sm text-muted-foreground">Revisit or continue a conversation saved in Atlas.</p></div></div>
+          <ul className="mt-6 space-y-3">{conversations.map(item => <li key={item.id}><button type="button" disabled={saving} onClick={() => { setActiveId(item.id); setDocumentError(''); setDraft(''); setTab('chat') }} className="flex w-full flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-left outline-none hover:border-primary/40 hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-ring"><div className="min-w-0"><p className="font-medium break-words">{item.answers[0] || 'New business onboarding'}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.startedAt).toLocaleString()} · {item.answers.length} of {item.fields.length} questions answered</p></div><span className="rounded-full bg-secondary px-3 py-1 text-xs font-medium text-secondary-foreground">{item.id === active.id ? 'Current' : item.answers.length === item.fields.length ? 'Draft complete' : 'In progress'}</span></button></li>)}</ul>
         </section>
       </div>
       {apiError && <p role="alert" className="mt-3 text-sm text-destructive">{apiError}</p>}
@@ -322,6 +342,27 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   </CustomerLayout>
 }
 
-function BotMessage({ children }: { children: string | string[] }) {
+function OnboardingTranscript({ conversation }: { conversation: Conversation }) {
+  return conversation.prompts.slice(0, conversation.answers.length + 1).map((prompt, sequence) => {
+    const turns = conversation.turns.filter(turn => turn.sequence === sequence)
+    const answer = conversation.answers[sequence]
+    const hasAcceptedTurn = turns.some(turn => !turn.clarification)
+
+    return <div key={sequence} className="space-y-4">
+      <BotMessage>{prompt}</BotMessage>
+      {turns.map(turn => <div key={turn.id} className="space-y-4">
+        <CustomerMessage>{turn.content}</CustomerMessage>
+        {turn.clarification && <BotMessage>{turn.clarification}</BotMessage>}
+      </div>)}
+      {answer !== undefined && !hasAcceptedTurn && <CustomerMessage>{answer}</CustomerMessage>}
+    </div>
+  })
+}
+
+function CustomerMessage({ children }: { children: string }) {
+  return <div className="ml-auto max-w-[85%] rounded-2xl rounded-tr-sm bg-primary px-4 py-3 text-sm leading-6 whitespace-pre-wrap break-words text-primary-foreground"><span className="sr-only">You: </span>{children}</div>
+}
+
+function BotMessage({ children }: { children: string }) {
   return <div className="flex max-w-[95%] items-start gap-3 sm:max-w-[85%]"><span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent text-primary"><Bot className="size-4" aria-hidden="true" /></span><div className="rounded-2xl rounded-tl-sm bg-muted px-4 py-3 text-sm leading-6"><span className="sr-only">Onboarding guide: </span>{children}</div></div>
 }
