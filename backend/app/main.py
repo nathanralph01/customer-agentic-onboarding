@@ -1,5 +1,6 @@
 """Customer 360 demo API with Atlas-backed onboarding conversations."""
 
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -19,15 +20,20 @@ from gridfs import GridFSBucket
 from gridfs.errors import NoFile
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, ReturnDocument
+from pymongo.client_session import ClientSession
 from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
+from .onboarding_agent import QUESTIONS, REVIEW, WELCOME, agent_enabled, interpret_answer
+
 load_dotenv(Path(__file__).resolve().parents[2] / "database" / ".env")
+
+logger = logging.getLogger(__name__)
 
 DEMO_CUSTOMER_NAME = "Northstar Test Goods Ltd."
 DEMO_USER_EMAIL = "customer.demo@customer360.example"
-QUESTION_COUNT = 5
+QUESTION_COUNT = len(QUESTIONS)
 MAX_DOCUMENT_SIZE = 10 * 1024 * 1024
 MAX_DOCUMENTS_PER_CONVERSATION = 10
 ALLOWED_DOCUMENT_EXTENSIONS = {
@@ -52,10 +58,29 @@ class AnswerPayload(BaseModel):
     content: str = Field(min_length=1, max_length=4000)
 
 
+class ChatPayload(BaseModel):
+    id: UUID
+    revision: int = Field(ge=0)
+    sequence: int = Field(ge=0, lt=QUESTION_COUNT)
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class ChatTurn(BaseModel):
+    id: UUID
+    sequence: int
+    content: str
+    clarification: str
+
+
 class ConversationResponse(BaseModel):
     id: str
     startedAt: str
     answers: list[str]
+    fields: list[str]
+    prompts: list[str]
+    turns: list[ChatTurn]
+    revision: int
+    agentEnabled: bool
 
 
 class DocumentResponse(BaseModel):
@@ -155,9 +180,11 @@ def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
     return customer["_id"], user["_id"]
 
 
-def _read_answers(database: Database, conversation_id: ObjectId) -> list[str]:
+def _read_answers(
+    database: Database, conversation_id: ObjectId, session: ClientSession | None = None
+) -> list[str]:
     messages = database["messages"].find(
-        {"conversation_id": conversation_id, "role": "user"}
+        {"conversation_id": conversation_id, "role": "user"}, session=session
     ).sort("sequence", 1)
     return [message["content"] for message in messages]
 
@@ -167,6 +194,11 @@ def _conversation_response(document: dict, answers: list[str]) -> ConversationRe
         id=document["client_id"],
         startedAt=document["created_at"].isoformat(),
         answers=answers,
+        fields=[field for field, _ in QUESTIONS],
+        prompts=[WELCOME + QUESTIONS[0][1], *[question for _, question in QUESTIONS[1:]], REVIEW],
+        turns=document.get("chat_turns", []),
+        revision=document.get("chat_revision", 0),
+        agentEnabled=agent_enabled(),
     )
 
 
@@ -200,10 +232,11 @@ def _save_answer(
     customer_id: ObjectId,
     sequence: int,
     content: str,
+    session: ClientSession | None = None,
 ) -> None:
     messages = database["messages"]
     query = {"conversation_id": conversation["_id"], "sequence": sequence}
-    existing = messages.find_one(query)
+    existing = messages.find_one(query, session=session)
     if existing is not None:
         if existing["content"] != content:
             raise HTTPException(
@@ -212,7 +245,7 @@ def _save_answer(
             )
     else:
         current_count = messages.count_documents(
-            {"conversation_id": conversation["_id"], "role": "user"}
+            {"conversation_id": conversation["_id"], "role": "user"}, session=session
         )
         if sequence != current_count:
             raise HTTPException(
@@ -228,17 +261,20 @@ def _save_answer(
                     "content": content,
                     "sequence": sequence,
                     "created_at": now,
-                }
+                },
+                session=session,
             )
         except DuplicateKeyError:
-            existing = messages.find_one(query)
+            if session is not None:
+                raise
+            existing = messages.find_one(query, session=session)
             if existing is None or existing["content"] != content:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="This answer sequence was already saved with different content.",
                 ) from None
 
-    answers = _read_answers(database, conversation["_id"])
+    answers = _read_answers(database, conversation["_id"], session)
     now = datetime.now(timezone.utc)
     database["onboardings"].update_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id},
@@ -250,6 +286,7 @@ def _save_answer(
                 "updated_at": now,
             }
         },
+        session=session,
     )
     database["conversations"].update_one(
         {"_id": conversation["_id"]},
@@ -259,6 +296,7 @@ def _save_answer(
                 "updated_at": now,
             }
         },
+        session=session,
     )
 
 
@@ -358,6 +396,82 @@ def save_conversation_answer(
     return _conversation_response(
         conversation, _read_answers(database, conversation["_id"])
     )
+
+
+@app.post("/api/v1/conversations/{conversation_id}/chat", response_model=ConversationResponse)
+def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Request):
+    database = get_database(request)
+    customer_id, _ = ensure_demo_profile(database)
+    conversation = _owned_conversation(database, customer_id, conversation_id)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="Enter a message before sending.")
+
+    turn_id = str(payload.id)
+
+    def current_turn(document: dict, answers: list[str]) -> bool:
+        for turn in document.get("chat_turns", []):
+            if turn["id"] == turn_id:
+                if turn["content"] == content and turn["sequence"] == payload.sequence:
+                    return False
+                raise HTTPException(status_code=409, detail="This message ID is already in use.")
+        if document.get("chat_revision", 0) != payload.revision or len(answers) != payload.sequence:
+            raise HTTPException(status_code=409, detail="This conversation changed. Reload it and try again.")
+        return True
+
+    answers = _read_answers(database, conversation["_id"])
+    if not current_turn(conversation, answers):
+        return _conversation_response(conversation, answers)
+
+    recent_turns = [
+        {"message": turn["content"], "clarification": turn["clarification"]}
+        for turn in conversation.get("chat_turns", [])
+        if turn["sequence"] == payload.sequence
+    ][-5:]
+    try:
+        decision = interpret_answer(payload.sequence, content, recent_turns)
+    except Exception as error:
+        logger.warning("Onboarding guide failed (%s)", type(error).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="The onboarding guide is unavailable. Your message can be retried.",
+        ) from None
+
+    def persist(session: ClientSession):
+        latest = database.conversations.find_one({"_id": conversation["_id"]}, session=session)
+        if latest is None:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        latest_answers = _read_answers(database, latest["_id"], session)
+        if not current_turn(latest, latest_answers):
+            return _conversation_response(latest, latest_answers)
+
+        saved = database.conversations.find_one_and_update(
+            {"_id": latest["_id"]},
+            {
+                "$inc": {"chat_revision": 1},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+                "$push": {
+                    "chat_turns": {
+                        "$each": [{
+                            "id": turn_id,
+                            "sequence": payload.sequence,
+                            "content": content,
+                            "clarification": decision.reply,
+                        }],
+                        "$slice": -50,
+                    },
+                },
+            },
+            return_document=ReturnDocument.AFTER,
+            session=session,
+        )
+        if decision.action == "accept":
+            _save_answer(database, saved, customer_id, payload.sequence, decision.answer, session)
+            latest_answers.append(decision.answer)
+        return _conversation_response(saved, latest_answers)
+
+    with database.client.start_session() as session:
+        return session.with_transaction(persist)
 
 
 @app.get(

@@ -1,6 +1,24 @@
 const API_URL = (import.meta.env.VITE_API_URL || '/api/v1').replace(/\/$/, '')
 
-export type Conversation = { id: string; startedAt: string; answers: string[] }
+export type ConversationDraft = { id: string; startedAt: string; answers: string[] }
+export type ChatTurn = { id: string; sequence: number; content: string; clarification: string }
+export type Conversation = ConversationDraft & {
+  fields: string[]
+  prompts: string[]
+  turns: ChatTurn[]
+  revision: number
+  agentEnabled: boolean
+}
+export type ChatMessage = Omit<ChatTurn, 'clarification'> & { revision: number }
+
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.status = status
+  }
+}
 export type OnboardingDocument = {
   id: string
   filename: string
@@ -11,7 +29,12 @@ export type OnboardingDocument = {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, init)
-  if (!response.ok) throw new Error(`Request failed with status ${response.status}.`)
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new ApiError(response.status, typeof body?.detail === 'string'
+      ? body.detail
+      : `Request failed with status ${response.status}.`)
+  }
   return response.json() as Promise<T>
 }
 
@@ -25,7 +48,7 @@ export function listConversations(): Promise<Conversation[]> {
   return request('/conversations')
 }
 
-export function createConversation(conversation: Conversation): Promise<Conversation> {
+export function createConversation(conversation: ConversationDraft): Promise<Conversation> {
   return request('/conversations', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -33,15 +56,11 @@ export function createConversation(conversation: Conversation): Promise<Conversa
   })
 }
 
-export function saveConversationAnswer(
-  id: string,
-  sequence: number,
-  content: string,
-): Promise<Conversation> {
-  return request(`/conversations/${encodeURIComponent(id)}/answers`, {
+export function sendChatMessage(id: string, message: ChatMessage): Promise<Conversation> {
+  return request(`/conversations/${encodeURIComponent(id)}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sequence, content }),
+    body: JSON.stringify(message),
   })
 }
 

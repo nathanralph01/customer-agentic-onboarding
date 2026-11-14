@@ -29,3 +29,26 @@ tests from `backend/`:
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
+
+## Onboarding chatbot MVP
+
+Open the customer demo and select business onboarding. FastAPI supplies the
+questions, tracks progress, and saves chat turns and accepted answers in Atlas.
+The existing conversation history can resume previously saved drafts.
+
+The chatbot starts in guided mode with MongoDB alone. To enable model-assisted
+follow-ups, install the updated backend requirements and the LangChain
+integration package for your chosen provider. Set `ONBOARDING_CHAT_MODEL` to
+`provider:model` and configure that provider's credentials before starting
+Uvicorn. Choose a chat model that supports LangChain structured output.
+
+The backend sends synthetic chat messages and recent clarifications to the
+configured provider through LangChain. The intake instructions live in
+`app/skills/onboarding-intake/SKILL.md`. A provider error keeps the current
+question open so the message can be retried.
+
+The frontend calls `POST /api/v1/conversations/{conversation_id}/chat` with a
+message UUID, the observed conversation revision, the question sequence, and
+message content. Resending a recent message with the same UUID is safe.
+The chat endpoint uses MongoDB transactions to save an accepted answer and the
+associated chat turn together. Use Atlas or a MongoDB replica set.
