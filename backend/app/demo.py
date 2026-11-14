@@ -97,3 +97,10 @@ async def conversation_actor(database: Database, customer_id: str | None) -> tup
     if user is None:
         raise HTTPException(status_code=404, detail="Demo customer not found.")
     return customer, user["_id"]
+
+
+def customer_scope(customer_id: ObjectId) -> dict:
+    return {"$or": [
+        {"owner_customer_id": customer_id},
+        {"owner_customer_id": {"$exists": False}, "customer_id": customer_id},
+    ]}

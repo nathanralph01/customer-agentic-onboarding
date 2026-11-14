@@ -15,7 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from .mcp_database import MCPBucket, MCPDatabase as Database
 from .workflow_agents import AgreementDraft, EvidenceCheck, RiskRecommendation, cited_sources, run_skill
 
-from .demo import _upsert_by_key, conversation_actor, ensure_demo_profile, get_actor, get_database, object_id
+from .demo import customer_scope, _upsert_by_key, conversation_actor, ensure_demo_profile, get_actor, get_database, object_id
 from .documents import document_response, store_upload, stream_document
 from .workflow import GATES, REQUIRED_DOCUMENTS, RISK_POLICY, STEPS, TERMINAL, SIGNED_WORKFLOW, SIGNED_STATES, case_status, now, progress, transition, uses_signed_workflow, workflow_steps
 
@@ -96,7 +96,7 @@ async def personas(database: Db):
 async def case(database, onboarding_id, customer_id=None):
     query = {"_id": object_id(onboarding_id), "status": {"$ne": "DRAFT"}}
     if customer_id is not None:
-        query["customer_id"] = customer_id
+        query.update(customer_scope(customer_id))
     record = await database.onboardings.find_one(query)
     if record is None:
         raise HTTPException(404, "Onboarding not found.")
@@ -133,7 +133,7 @@ async def start_application(payload: Application, database: Db, actor: Customer)
     customer_id, user_id = actor
     client_id = str(payload.conversationId or payload.id)
     application = payload.model_dump(exclude={"id", "conversationId"})
-    lookup = {"customer_id": customer_id, "client_id": client_id}
+    lookup = {"client_id": client_id, **customer_scope(customer_id)}
     record = await database.onboardings.find_one(lookup)
     if payload.conversationId and record is None:
         raise HTTPException(404, "Conversation draft not found.")
@@ -153,8 +153,8 @@ async def start_application(payload: Application, database: Db, actor: Customer)
                 {"_id": record["_id"], "status": "DRAFT"}, {"$set": fields},
             )
         else:
-            await database.onboardings.upsert(lookup, {
-                **lookup, **fields, "created_at": now(), "created_by": user_id,
+            await database.onboardings.upsert({"client_id": client_id, "customer_id": customer_id}, {
+                **fields, "created_at": now(), "created_by": user_id,
             })
         record = await database.onboardings.find_one(lookup)
     if record is None or record.get("application") != application:
@@ -167,7 +167,7 @@ async def start_application(payload: Application, database: Db, actor: Customer)
 @router.get("/customer/onboardings")
 async def customer_cases(database: Db, actor: Customer):
     return [progress(row) for row in await database.onboardings.find({
-        "customer_id": actor[0], "status": {"$ne": "DRAFT"},
+        **customer_scope(actor[0]), "status": {"$ne": "DRAFT"},
     }, sort=("updated_at", -1))]
 
 
@@ -203,7 +203,7 @@ async def upload_case_document(onboarding_id: str, database: Db, actor: Customer
         raise HTTPException(409, "This onboarding no longer accepts uploads.")
     if uses_signed_workflow(record) and record["stage"] == 5:
         raise HTTPException(409, "Wait for the bank to reopen the application before uploading evidence.")
-    return await store_upload(database, actor[0], record["_id"], file)
+    return await store_upload(database, record["customer_id"], record["_id"], file)
 
 
 async def download_case_document(database, record, document_id, admin=False):

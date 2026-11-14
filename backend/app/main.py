@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from hashlib import sha256
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,7 @@ from starlette.concurrency import run_in_threadpool
 from .mcp_database import MCPDatabase as Database, MCPBucket, NoFile, DuplicateKeyError, StorageError, tool
 from .mongodb_mcp import mongodb_mcp_session
 
-from .demo import _upsert_by_key, conversation_actor, get_database
+from .demo import customer_scope, _upsert_by_key, conversation_actor, get_database
 from .documents import document_response, store_upload, stream_document
 from .routers import router
 from .onboarding_agent import QUESTIONS, REVIEW, WELCOME, agent_enabled, interpret_answer
@@ -135,6 +136,24 @@ async def storage_request(request: Request, call_next):
     return response
 
 
+async def create_business_profile(database: Database, client_id: str, started_at: datetime):
+    # Stable IDs make retries safe even if the first request stopped halfway.
+    customer_id = ObjectId(sha256(f"customer:{client_id}".encode()).digest()[:12])
+    user_id = ObjectId(sha256(f"applicant:{client_id}".encode()).digest()[:12])
+    customer = await _upsert_by_key(database["customers"], {"_id": customer_id}, {
+        "legal_name": "Business name pending", "created_at": started_at,
+        "updated_at": started_at, "owners": [], "onboarding_client_id": client_id,
+    })
+    # The current schema requires created_by to reference a user. This anonymous
+    # applicant record is scoped to this application; it is not a login identity.
+    user = await _upsert_by_key(database["users"], {"_id": user_id}, {
+        "name": "Anonymous business applicant", "email": f"{client_id}@applicant.invalid",
+        "role": "customer", "customer_id": customer["_id"],
+        "created_at": started_at, "updated_at": started_at,
+    })
+    return customer["_id"], user["_id"]
+
+
 async def _read_answers(
     database: Database, conversation_id: ObjectId
 ) -> list[str]:
@@ -162,7 +181,7 @@ async def _owned_conversation(
     database: Database, customer_id: ObjectId, conversation_id: UUID
 ) -> dict:
     conversation = await database["conversations"].find_one(
-        {"client_id": str(conversation_id), "customer_id": customer_id}
+        {"client_id": str(conversation_id), **customer_scope(customer_id)}
     )
     if conversation is None:
         raise HTTPException(
@@ -179,7 +198,7 @@ async def _save_answer(
     sequence: int,
     content: str,
 ) -> list[str]:
-    onboarding = await database.onboardings.find_one(
+    onboarding = await database["onboardings"].find_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id},
     )
     if onboarding is None or onboarding["status"] != "DRAFT":
@@ -215,11 +234,16 @@ async def _save_answer(
         answers.append(content)
 
     now = datetime.now(timezone.utc)
+    fields = ("legal_name", "business_activity", "registration_location", "ownership_description", "banking_needs")
+    application = dict(zip(fields, answers))
+    if conversation.get("owner_customer_id") and application:
+        profile = {field: application[field] for field in fields[:4] if field in application}
+        await database["customers"].update_one({"_id": customer_id}, {"$set": {**profile, "updated_at": now}})
     await database["onboardings"].update_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id, "status": "DRAFT"},
         {
             "$set": {
-                "application": {"answers": answers},
+                "application": {**application, "answers": answers},
                 "current_step": "review" if len(answers) == QUESTION_COUNT
                 else f"question_{len(answers) + 1}",
                 "updated_at": now,
@@ -250,7 +274,7 @@ async def list_conversations(request: Request):
     database = get_database(request)
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversations = await database["conversations"].find(
-        {"customer_id": customer_id}, sort=("updated_at", -1)
+        customer_scope(customer_id), sort=("updated_at", -1)
     )
     if not conversations:
         return []
@@ -284,7 +308,7 @@ async def list_conversations(request: Request):
         if row["onboarding_id"] in submitted:
             row["application_submitted"] = True
         if row.get("pending_answer") and not row.get("application_submitted"):
-            responses[row["_id"]] = await _chat_response(database, row, customer_id)
+            responses[row["_id"]] = await _chat_response(database, row, row["customer_id"])
     return [
         responses[row["_id"]] if row["_id"] in responses
         else _conversation_response(row, answers.get(row["_id"], []))
@@ -299,26 +323,32 @@ async def list_conversations(request: Request):
 )
 async def create_conversation(payload: ConversationPayload, request: Request):
     database = get_database(request)
-    customer_id, user_id = await conversation_actor(database, request.query_params.get("customer_id"))
+    owner_id, owner_user_id = await conversation_actor(database, request.query_params.get("customer_id"))
     client_id = str(payload.id)
     started_at = payload.startedAt
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
     started_at = started_at.astimezone(timezone.utc)
-    onboarding = await _upsert_by_key(
-        database["onboardings"],
-        {"client_id": client_id, "customer_id": customer_id},
-        {
-            "created_at": started_at,
-            "updated_at": started_at,
-            "customer_id": customer_id,
-            "created_by": user_id,
-            "status": "DRAFT",
-            "current_step": "question_1",
-            "application": {"answers": []},
-            "requested_products": [],
-        },
-    )
+    existing = await database.conversations.find_one({"client_id": client_id})
+    if existing:
+        conversation = await _owned_conversation(database, owner_id, payload.id)
+        for sequence, answer in enumerate(payload.answers):
+            await _save_answer(database, conversation, conversation["customer_id"], sequence, answer)
+        return await _chat_response(database, conversation, conversation["customer_id"])
+    # Reserve the draft under the selected persona before provisioning its profile.
+    claim = await database.onboardings.upsert({"client_id": client_id}, {
+        "client_id": client_id, "customer_id": owner_id, "owner_customer_id": owner_id,
+        "created_by": owner_user_id,
+        "status": "DRAFT", "created_at": started_at, "updated_at": started_at,
+    })
+    if claim.get("owner_customer_id", claim["customer_id"]) != owner_id:
+        raise HTTPException(404, "Conversation not found.")
+    customer_id, user_id = await create_business_profile(database, client_id, started_at)
+    await database.onboardings.update_one({"_id": claim["_id"], "status": "DRAFT"}, {"$set": {
+        "customer_id": customer_id, "created_by": user_id, "current_step": "question_1",
+        "application": {"answers": []}, "requested_products": [],
+    }})
+    onboarding = claim
     conversation = await _upsert_by_key(
         database["conversations"],
         {"client_id": client_id, "customer_id": customer_id},
@@ -327,6 +357,7 @@ async def create_conversation(payload: ConversationPayload, request: Request):
             "updated_at": started_at,
             "customer_id": customer_id,
             "onboarding_id": onboarding["_id"],
+            "owner_customer_id": owner_id,
             "title": "Business onboarding",
             "status": "active",
         },
@@ -348,13 +379,14 @@ async def save_conversation_answer(
     database = get_database(request)
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversation = await database["conversations"].find_one(
-        {"client_id": str(conversation_id), "customer_id": customer_id}
+        {"client_id": str(conversation_id), **customer_scope(customer_id)}
     )
     if conversation is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found.",
         )
+    customer_id = conversation["customer_id"]
     content = payload.content.strip()
     if not content:
         raise HTTPException(
@@ -367,7 +399,7 @@ async def save_conversation_answer(
 
 async def _chat_response(database, conversation, customer_id):
     if not conversation.get("application_submitted"):
-        onboarding = await database.onboardings.find_one({"_id": conversation["onboarding_id"]})
+        onboarding = await database["onboardings"].find_one({"_id": conversation["onboarding_id"]})
         if onboarding and onboarding["status"] != "DRAFT":
             conversation = {**conversation, "application_submitted": True}
         elif turn := conversation.get("pending_answer"):
@@ -385,6 +417,7 @@ async def send_chat_message(conversation_id: UUID, payload: ChatPayload, request
     database = get_database(request)
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversation = await _owned_conversation(database, customer_id, conversation_id)
+    customer_id = conversation["customer_id"]
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=422, detail="Enter a message before sending.")
@@ -455,6 +488,7 @@ async def list_documents(conversation_id: UUID, request: Request):
     database = get_database(request)
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversation = await _owned_conversation(database, customer_id, conversation_id)
+    customer_id = conversation["customer_id"]
     documents = await database["documents"].find(
         {"customer_id": customer_id, "conversation_id": conversation["_id"]}, sort=("created_at", 1)
     )
@@ -481,6 +515,7 @@ async def upload_document(
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversation = await _owned_conversation(database, customer_id, conversation_id)
     await check_conversation_upload_allowed(database, conversation)
+    customer_id = conversation["customer_id"]
     return await store_upload(database, customer_id, conversation["onboarding_id"], file, conversation["_id"])
 
 
@@ -496,8 +531,12 @@ async def download_document(document_id: str, request: Request):
             detail="Document not found.",
         ) from None
     document = await database["documents"].find_one(
-        {"_id": object_id, "customer_id": customer_id}
+        {"_id": object_id}
     )
+    if document and document["customer_id"] != customer_id:
+        owned = await database.onboardings.find_one({"_id": document["onboarding_id"], **customer_scope(customer_id)})
+        if not owned:
+            document = None
     if document is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -511,6 +550,7 @@ async def delete_document(conversation_id: UUID, document_id: str, request: Requ
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversation = await _owned_conversation(database, customer_id, conversation_id)
     await check_conversation_upload_allowed(database, conversation)
+    customer_id = conversation["customer_id"]
     try:
         object_id = ObjectId(document_id)
     except InvalidId:
