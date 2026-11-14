@@ -43,7 +43,7 @@ export function Documents({ documents, download, downloading }: { documents: Cas
 }
 
 export function ConfirmDialog({ title, description, action, onConfirm, onClose }: {
-  title: string; description: string; action: string; onConfirm: () => void; onClose: () => void
+  title: string; description: string; action: string; onConfirm?: () => void; onClose: () => void
 }) {
   const dialog = useRef<HTMLDialogElement>(null)
   const id = useId()
@@ -54,8 +54,8 @@ export function ConfirmDialog({ title, description, action, onConfirm, onClose }
     <h2 id={id} className="text-lg font-semibold">{title}</h2>
     <p id={`${id}-description`} className="mt-2 whitespace-pre-wrap break-words text-sm text-muted-foreground">{description}</p>
     <div className="mt-5 flex flex-wrap justify-end gap-2">
-      <Button autoFocus variant="outline" onClick={onClose}>Go back</Button>
-      <Button className="bg-destructive text-white hover:bg-destructive/90" onClick={onConfirm}>{action}</Button>
+      <Button autoFocus variant="outline" onClick={onClose}>{onConfirm ? 'Go back' : action}</Button>
+      {onConfirm && <Button className="bg-destructive text-white hover:bg-destructive/90" onClick={onConfirm}>{action}</Button>}
     </div>
   </dialog>
 }

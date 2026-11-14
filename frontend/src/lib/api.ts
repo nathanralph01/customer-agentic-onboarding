@@ -12,12 +12,16 @@ export type Conversation = ConversationDraft & {
 }
 export type ChatMessage = Omit<ChatTurn, 'clarification'> & { revision: number }
 
+export type ApplicationFieldError = { field: keyof Application; message: string }
+
 export class ApiError extends Error {
   readonly status: number
+  readonly fields: ApplicationFieldError[]
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, fields: ApplicationFieldError[] = []) {
     super(message)
     this.status = status
+    this.fields = fields
   }
 }
 export type OnboardingDocument = {
@@ -32,9 +36,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path.startsWith('/conversations') ? actorPath(path, 'customer') : path}`, init)
   if (!response.ok) {
     const body = await response.json().catch(() => null)
-    throw new ApiError(response.status, typeof body?.detail === 'string'
-      ? body.detail
-      : `Request failed with status ${response.status}.`)
+    const detail = body?.detail
+    throw new ApiError(response.status,
+      typeof detail === 'string' ? detail : detail?.message ?? `Request failed with status ${response.status}.`,
+      detail?.fields ?? [],
+    )
   }
   return response.json() as Promise<T>
 }

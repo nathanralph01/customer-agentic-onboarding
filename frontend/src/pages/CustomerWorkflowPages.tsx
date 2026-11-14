@@ -3,9 +3,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import CustomerLayout from '@/components/CustomerLayout'
 import { Button, buttonVariants } from '@/components/ui/button'
-import { CaseList, Documents, Field, RequestStatus } from '@/components/WorkflowUi'
+import { CaseList, ConfirmDialog, Documents, Field, RequestStatus } from '@/components/WorkflowUi'
 import { card, caseOpen, dateLabel, input, page, statusLabel } from '@/lib/workflowUi'
-import { customerApi, downloadCaseDocument, type Application, type CaseDocument } from '@/lib/api'
+import { ApiError, customerApi, downloadCaseDocument, type Application, type CaseDocument } from '@/lib/api'
 
 type Props = { onLogout: () => void }
 
@@ -23,11 +23,24 @@ export function ApplicationPage({ onLogout }: Props) {
   const [form, setForm] = useState<Application>({ businessName: name, businessActivity: activity, registration, owners, products, sector: '' })
   const [step, setStep] = useState(0)
   const [showErrors, setShowErrors] = useState(false)
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<keyof Application, string>>>({})
+  const [validationNotice, setValidationNotice] = useState('')
   const missingFields = fields[step].filter(({ key }) => !form[key].trim())
   const [applicationId] = useState(() => crypto.randomUUID())
   const submit = useMutation({
     mutationFn: () => customerApi.submit({ ...form, id: applicationId, conversationId: draft?.conversationId }),
     onSuccess: saved => navigate(`/customer/cases/${saved.id}`, { replace: true }),
+    onError: error => {
+      if (!(error instanceof ApiError) || error.status !== 422) return
+      const issues = Object.fromEntries(error.fields.map(issue => [issue.field, issue.message]))
+      const invalidStep = fields.findIndex(group => group.some(({ key }) => key in issues))
+      setFieldErrors(issues)
+      if (invalidStep >= 0) setStep(invalidStep)
+      setValidationNotice(error.fields.length ? fields.flat()
+        .filter(({ key }) => key in issues)
+        .map(({ key, label }) => `${label} — ${issues[key]}`).join('\n')
+        : error.message)
+    },
   })
 
   function next(event: FormEvent<HTMLFormElement>) {
@@ -39,7 +52,7 @@ export function ApplicationPage({ onLogout }: Props) {
     }
     setShowErrors(false)
     if (step < fields.length - 1) setStep(step + 1)
-    else submit.mutate()
+    else if (!submit.isPending) submit.mutate()
   }
 
   return <CustomerLayout onLogout={onLogout} onboarding>
@@ -47,25 +60,31 @@ export function ApplicationPage({ onLogout }: Props) {
       <div><h1 className="text-3xl font-bold">Business banking application</h1><p className="mt-2 text-sm text-muted-foreground">Step {step + 1} of {fields.length} · {['Business details', 'Ownership', 'Products'][step]}</p></div>
       <form key={step} noValidate onSubmit={next} className={`${card} max-w-2xl space-y-4`}>
         {fields[step].map(({ key, label }) => {
-          const invalid = showErrors && !form[key].trim()
+          const error = fieldErrors[key] || (showErrors && !form[key].trim() ? 'This field is required.' : '')
+          const invalid = !!error
           return <div key={key}>
             <Field label={label}>
               <textarea name={key} className={input} required maxLength={4000}
                 aria-invalid={invalid || undefined} aria-describedby={invalid ? `${key}-error` : undefined}
                 rows={key === 'owners' || key === 'businessActivity' ? 3 : 1} value={form[key]}
-                onChange={event => setForm(current => ({ ...current, [key]: event.target.value }))} />
+                readOnly={submit.isPending}
+                onChange={event => {
+                  setFieldErrors(current => ({ ...current, [key]: undefined }))
+                  setForm(current => ({ ...current, [key]: event.target.value }))
+                }} />
             </Field>
             {key === 'products' && <p className="mt-1 text-sm text-muted-foreground">Choose Business account, Payments, or Credit facility. Payments and Credit facility require a Business account.</p>}
-            {invalid && <p id={`${key}-error`} className="mt-1 text-sm text-destructive">This field is required.</p>}
+            {invalid && <p id={`${key}-error`} className="mt-1 text-sm text-destructive">{error}</p>}
           </div>
         })}
         {showErrors && missingFields.length > 0 && <p role="alert" className="text-sm text-destructive">Complete the required fields to continue.</p>}
-        <RequestStatus pending={submit.isPending} label="Submitting application…" error={submit.error} />
+        <RequestStatus pending={submit.isPending} label="Validating application…" error={submit.error instanceof ApiError && submit.error.status === 422 ? null : submit.error} />
         <div className="flex flex-wrap gap-3">
           {step > 0 && <Button type="button" variant="outline" onClick={() => { setShowErrors(false); setStep(step - 1) }} disabled={submit.isPending}>Back</Button>}
           <Button type="submit" disabled={submit.isPending}>{submit.isPending ? 'Submitting…' : step === fields.length - 1 ? 'Submit application' : 'Continue'}</Button>
         </div>
       </form>
+      {validationNotice && <ConfirmDialog title="Invalid value" description={validationNotice} action="Fix application" onClose={() => setValidationNotice('')} />}
     </main>
   </CustomerLayout>
 }

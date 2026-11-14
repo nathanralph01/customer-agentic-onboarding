@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import os
 from hashlib import sha256
 from datetime import date, datetime, time, timezone
@@ -16,7 +17,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .mcp_database import MCPBucket, MCPDatabase as Database
 from .reference_search import REFERENCE_FIELDS, SCOPE, retrieve_references
-from .workflow_agents import AgreementDraft, FinalAssessment, cited_sources, run_skill
+from .workflow_agents import AgreementDraft, ApplicationValidation, FinalAssessment, cited_sources, run_skill
 
 from .agreement_terms import pricing_schedule, render_schedule
 from .demo import customer_scope, _upsert_by_key, conversation_actor, ensure_demo_profile, get_actor, get_database, object_id
@@ -132,6 +133,28 @@ async def change(database, record, updates, actor, role, action, comments="", ov
     return updated
 
 
+async def validate_application(application: dict):
+    placeholders = {
+        "i dont know", "dont know", "i do not know", "do not know", "unknown",
+        "not sure", "unsure", "tbd", "n a", "na", "none", "test", "idk", "no idea",
+    }
+    issues = []
+    for field, value in application.items():
+        normalized = re.sub(r"[^\w]+", " ", value.casefold().replace("’", "").replace("'", "")).strip()
+        if not normalized or normalized in placeholders:
+            issues.append({"field": field, "message": "Enter a valid value for this field."})
+    if not any(issue["field"] == "products" for issue in issues):
+        try:
+            pricing_schedule(application["products"])
+        except ValueError as error:
+            issues.append({"field": "products", "message": str(error)})
+    if not issues and os.getenv("ONBOARDING_CHAT_MODEL"):
+        result, _ = await agent_result("application-validation", ApplicationValidation, {"application": application})
+        issues = [issue.model_dump() for issue in result.issues]
+    if issues:
+        raise HTTPException(422, {"message": "Invalid application values.", "fields": issues})
+
+
 @router.post("/customer/onboardings", status_code=201)
 async def start_application(payload: Application, database: Db, actor: Customer):
     customer_id, user_id = actor
@@ -145,10 +168,7 @@ async def start_application(payload: Application, database: Db, actor: Customer)
         raise HTTPException(404, "Conversation draft not found.")
 
     if record is None or record["status"] == "DRAFT":
-        try:
-            pricing_schedule(payload.products)
-        except ValueError as error:
-            raise HTTPException(422, str(error)) from None
+        await validate_application(application)
         fields = {
             "status": "APPLIED", "workflow": SIGNED_WORKFLOW, "stage": 0, "revision": 0, "application": application,
             "required_documents": list(REQUIRED_DOCUMENTS),

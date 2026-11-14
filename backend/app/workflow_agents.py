@@ -9,6 +9,18 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+ApplicationField = Literal["businessName", "businessActivity", "registration", "owners", "products", "sector"]
+
+
+class ApplicationIssue(BaseModel):
+    field: ApplicationField
+    message: str = Field(min_length=1, max_length=300)
+
+
+class ApplicationValidation(BaseModel):
+    issues: list[ApplicationIssue] = Field(max_length=6)
+
+
 class AgreementDraft(BaseModel):
     missingFields: list[Literal["businessName", "registration", "products"]]
     coverNote: str = Field(min_length=1, max_length=800)
