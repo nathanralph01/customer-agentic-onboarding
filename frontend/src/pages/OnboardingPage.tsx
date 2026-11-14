@@ -49,6 +49,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   const [documents, setDocuments] = useState<Record<string, OnboardingDocument[]>>({})
   const [documentBusy, setDocumentBusy] = useState(false)
   const [documentError, setDocumentError] = useState('')
+  const [documentLoadAttempt, setDocumentLoadAttempt] = useState(0)
   const [dragging, setDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
@@ -71,16 +72,15 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
             sessionStorage.removeItem(STORAGE_KEY)
           }
         }
-        if (!saved.length) {
+        let ongoing = saved.find(item => !item.applicationId && item.answers.length < item.fields.length)
+        if (!ongoing && !cancelled) {
           initialConversation.current ??= newConversation()
-          saved = [await createConversation(initialConversation.current)]
+          ongoing = await createConversation(initialConversation.current)
+          saved = [ongoing, ...saved.filter(item => item.id !== ongoing?.id)]
         }
-        const savedDocuments = await Promise.all(saved.map(async conversation =>
-          [conversation.id, await listDocuments(conversation.id)] as const))
         if (!cancelled) {
           setConversations(saved)
-          setActiveId(saved[0].id)
-          setDocuments(Object.fromEntries(savedDocuments))
+          setActiveId(ongoing?.id ?? null)
         }
       } catch (error) {
         if (!cancelled) {
@@ -93,6 +93,20 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
     void load()
     return () => { cancelled = true }
   }, [loadAttempt])
+
+  const documentConversationId = tab === 'info' ? active?.id : undefined
+  const documentsLoaded = documentConversationId !== undefined && documents[documentConversationId] !== undefined
+
+  useEffect(() => {
+    if (!documentConversationId || documentsLoaded) return
+    let cancelled = false
+    listDocuments(documentConversationId).then(items => {
+      if (!cancelled) setDocuments(current => ({ ...current, [documentConversationId]: items }))
+    }).catch(error => {
+      if (!cancelled) setDocumentError(error instanceof Error ? error.message : 'Unable to load documents.')
+    })
+    return () => { cancelled = true }
+  }, [documentConversationId, documentsLoaded, documentLoadAttempt])
 
   const activeDocuments = active ? documents[active.id] || [] : []
   const complete = active && active.answers.length === active.fields.length
@@ -161,7 +175,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   }
 
   async function addDocuments(files: FileList | null) {
-    if (!files || !active || documentBusy) return
+    if (!files || !active || !documentsLoaded || documentBusy) return
     const accepted: File[] = []
     const errors: string[] = []
     for (const file of Array.from(files)) {
@@ -267,9 +281,14 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
         </div>
 
         <section role="tabpanel" id="panel-chat" aria-labelledby="tab-chat" hidden={tab !== 'chat'} className={tab === 'chat' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}>
-          <div className="flex shrink-0 items-center justify-between gap-3 border-b px-5 py-3">
+          <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
             <div className="flex items-center gap-3"><span className="flex size-10 items-center justify-center rounded-xl bg-accent text-primary"><Bot className="size-5" aria-hidden="true" /></span><div><h2 className="text-sm font-semibold">Your onboarding guide</h2><p className="text-xs text-muted-foreground">Business details · Owners · Banking needs</p></div></div>
-            <p className="text-xs font-medium text-muted-foreground">{active.answers.length} of {active.fields.length} questions answered</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-xs font-medium text-muted-foreground">{active.answers.length} of {active.fields.length} questions answered</p>
+              <Button type="button" variant="outline" size="sm" onClick={startNew} disabled={saving}>
+                <Plus aria-hidden="true" />Start new conversation
+              </Button>
+            </div>
           </div>
           <div ref={logRef} role="log" aria-label="Onboarding conversation" aria-live="polite" className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-5 py-4">
             <OnboardingTranscript conversation={active} />
@@ -295,9 +314,12 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
             <p className="mt-2 text-sm font-medium">Drop company documents here</p>
             <p id="document-types" className="mt-1 text-xs text-muted-foreground">PDF, DOCX, TXT, CSV, PNG or JPG · Up to 10 MB per file</p>
             <input ref={fileInputRef} type="file" multiple accept=".pdf,.docx,.txt,.csv,.png,.jpg,.jpeg" aria-label="Choose company documents" aria-describedby="document-types" className="hidden" onChange={event => { addDocuments(event.target.files); event.target.value = '' }} />
-            <Button variant="outline" className="mt-3" disabled={documentBusy || activeDocuments.length >= 10} onClick={() => fileInputRef.current?.click()}>{documentBusy ? 'Saving…' : 'Choose files'}</Button>
+            <Button variant="outline" className="mt-3" disabled={!documentsLoaded || documentBusy || activeDocuments.length >= 10} onClick={() => fileInputRef.current?.click()}>{documentBusy ? 'Saving…' : 'Choose files'}</Button>
           </div>
-          {documentError && <p role="alert" className="mt-3 text-sm text-destructive">{documentError}</p>}
+          {documentError && <div className="mt-3">
+            <p role="alert" className="text-sm text-destructive">{documentError}</p>
+            {!documentsLoaded && <Button variant="outline" size="sm" onClick={() => { setDocumentError(''); setDocumentLoadAttempt(attempt => attempt + 1) }}>Retry documents</Button>}
+          </div>}
           <p className="mt-3 text-xs text-muted-foreground">Documents are stored in Atlas and can be downloaded or removed. Document review is outside this intake step. Use synthetic documents only.</p>
           <div className="mt-5">
             <h3 className="text-sm font-semibold">Attached to this conversation</h3>
@@ -306,12 +328,12 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
               <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium" title={document.filename}>{document.filename}</p><p className="mt-1 text-xs text-muted-foreground">{document.sizeBytes < 1024 * 1024 ? `${Math.ceil(document.sizeBytes / 1024)} KB` : `${(document.sizeBytes / (1024 * 1024)).toFixed(1)} MB`} · Stored in Atlas</p></div>
               <Button variant="ghost" aria-label={`Download ${document.filename}`} disabled={documentBusy} onClick={() => downloadStoredDocument(document)}><Download aria-hidden="true" /></Button>
               <Button variant="ghost" aria-label={`Remove ${document.filename}`} disabled={documentBusy} onClick={() => removeStoredDocument(document)}><X aria-hidden="true" /></Button>
-            </li>)}</ul> : <p className="mt-2 text-sm text-muted-foreground">No documents added yet.</p>}
+            </li>)}</ul> : <p role="status" className="mt-2 text-sm text-muted-foreground">{documentsLoaded ? 'No documents added yet.' : documentError ? 'Documents unavailable.' : 'Loading documents…'}</p>}
           </div>
         </section>
 
         <section role="tabpanel" id="panel-history" aria-labelledby="tab-history" hidden={tab !== 'history'} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-5">
-          <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">Your conversations</h2><p className="mt-2 text-sm text-muted-foreground">Revisit or continue a conversation saved in Atlas.</p></div><Button onClick={startNew} disabled={saving}><Plus aria-hidden="true" />New conversation</Button></div>
+          <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">Your conversations</h2><p className="mt-2 text-sm text-muted-foreground">Revisit or continue a conversation saved in Atlas.</p></div></div>
           <ul className="mt-6 space-y-3">{conversations.map(item => <li key={item.id}><button type="button" disabled={saving} onClick={() => { setActiveId(item.id); setDocumentError(''); setDraft(''); setTab('chat') }} className="flex w-full flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-left outline-none hover:border-primary/40 hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-ring"><div className="min-w-0"><p className="font-medium break-words">{item.answers[0] || 'New business onboarding'}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.startedAt).toLocaleString()} · {item.answers.length} of {item.fields.length} questions answered</p></div><span className="rounded-full bg-secondary px-3 py-1 text-xs font-medium text-secondary-foreground">{item.id === active.id ? 'Current' : item.answers.length === item.fields.length ? 'Draft complete' : 'In progress'}</span></button></li>)}</ul>
         </section>
       </div>

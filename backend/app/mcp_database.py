@@ -138,6 +138,9 @@ class MCPCollection:
         return SimpleNamespace(inserted_id=document["_id"])
 
     async def update_one(self, query, update):
+        # An exact ID guarantees at most one match, including with extra predicates.
+        if isinstance(query.get("_id"), (ObjectId, str)):
+            return await self.database.call("update-many", self.name, filter=query, update=update)
         # Resolve exactly one _id because MCP exposes update-many, not update-one.
         existing = await self.find_one(query)
         if existing is not None:

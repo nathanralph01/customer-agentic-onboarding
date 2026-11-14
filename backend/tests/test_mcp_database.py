@@ -38,13 +38,11 @@ class MCPDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_update_keeps_revision_precondition(self):
         record_id = ObjectId()
         session = AsyncMock()
-        session.call_tool.side_effect = [
-            result({"documents": [{"_id": record_id, "revision": 3}]}),
-            result({"matchedCount": 1}),
-        ]
+        session.call_tool.return_value = result({"matchedCount": 1})
         db = MCPDatabase(session, "connection", "test")
         query = {"_id": record_id, "revision": 3}
         await db.onboardings.update_one(query, {"$inc": {"revision": 1}})
+        self.assertEqual(session.call_tool.await_count, 1)
         name, arguments = session.call_tool.call_args.args
         self.assertEqual(name, "update-many")
         self.assertEqual(decode(arguments["filter"]), query)
