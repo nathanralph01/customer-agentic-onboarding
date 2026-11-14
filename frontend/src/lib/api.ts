@@ -100,18 +100,22 @@ export async function downloadDocument(documentId: string): Promise<Blob> {
 export type Persona = { id: string; name: string; role: 'customer' | 'admin'; customerId: string | null }
 export type Application = { businessName: string; businessActivity: string; registration: string; owners: string; products: string; sector: string }
 export type Case = {
+  signedWorkflow?: boolean; agreementSigned?: boolean; rejected?: boolean
   id: string; status: string; stage: number; revision: number; currentStep: string; completed: number
   steps: string[]; application: Application; submittedAt: string; requiredDocuments: string[]
   requestedInformation: string; estimatedMinutes: number | null; estimatedCompletion: string | null
   informationResponses: { request: string; response: string; createdAt: string }[]
   contact: { name: string; email: string; phone: string }; riskTier?: string
 }
+export type Citation = { id: string; citation: string; url?: string | null }
 export type Risk = {
+  source?: string; sources?: Citation[]
   tier: 'low' | 'medium' | 'high'; rationale: string; evidence: string[]; missingInputs: string[]
   ownership: number; activity: number; geography: number; policyVersion?: number
 }
-export type CaseDocument = OnboardingDocument & { source: string }
+export type CaseDocument = OnboardingDocument & { source: string; coverNote?: string | null }
 export type CaseDetail = Case & {
+  verification?: { findings: string[]; missingInputs: string[]; sources: Citation[] };
   risk: Risk | null; documents: CaseDocument[]; checkpoint: { step: string; revision: number }
   history: { action: string; from: string | null; to: string; role: string; reason: string; created_at: string }[]
   actions: { id: string; target: string; state: string; reference?: string; evidence?: string }[]
@@ -156,6 +160,8 @@ export const customerApi = {
     request<Case>(actorPath(`${customerCases}/${id}/information`, 'customer'), jsonPost({ response })),
   sign: (id: string, signer: string) =>
     request<Case>(actorPath(`${customerCases}/${id}/sign`, 'customer'), jsonPost({ signer })),
+  returnAgreement: (id: string) =>
+    request<Case>(actorPath(`${customerCases}/${id}/return-agreement`, 'customer'), { method: 'POST' }),
   documents: (id: string) => request<CaseDocument[]>(actorPath(`${customerCases}/${id}/documents`, 'customer')),
   upload(id: string, file: File) {
     const body = new FormData()

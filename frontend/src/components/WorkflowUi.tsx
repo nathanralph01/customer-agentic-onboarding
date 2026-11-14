@@ -20,7 +20,7 @@ export function CaseList({ cases, admin = false }: { cases?: Case[]; admin?: boo
   return <ul className="grid gap-3">{cases.map(item => <li key={item.id}>
     <Link to={`/${admin ? 'admin' : 'customer'}/cases/${item.id}`} className={`${card} flex flex-wrap items-center justify-between gap-3 hover:border-primary`}>
       <div><p className="font-semibold">{item.application.businessName}</p><p className="mt-1 text-xs text-muted-foreground">{item.currentStep} · {dateLabel(item.submittedAt)}</p></div>
-      <p className="text-sm capitalize">{statusLabel(item.status)}{item.riskTier && ` · ${item.riskTier} risk`}</p>
+      <p className="text-sm capitalize">{item.rejected ? 'rejected' : statusLabel(item.status)}{item.riskTier && ` · ${item.riskTier} risk`}</p>
     </Link>
   </li>)}</ul>
 }
@@ -28,7 +28,7 @@ export function CaseList({ cases, admin = false }: { cases?: Case[]; admin?: boo
 export function Documents({ documents, download }: { documents: CaseDocument[]; download: (item: CaseDocument) => void }) {
   if (!documents.length) return <p className="text-sm text-muted-foreground">No documents yet.</p>
   return <ul className="divide-y">{documents.map(document => <li key={document.id} className="flex flex-wrap items-center justify-between gap-3 py-3">
-    <div className="min-w-0 break-all"><p className="text-sm font-medium">{document.filename}</p><p className="text-xs capitalize text-muted-foreground">{document.source}</p></div>
+    <div className="min-w-0 break-all"><p className="text-sm font-medium">{document.filename}</p><p className="text-xs capitalize text-muted-foreground">{document.source}</p>{document.coverNote && <p className="mt-1 break-words text-xs text-muted-foreground">{document.coverNote}</p>}</div>
     <Button variant="outline" size="sm" onClick={() => download(document)} aria-label={`Download ${document.filename}`}>Download</Button>
   </li>)}</ul>
 }

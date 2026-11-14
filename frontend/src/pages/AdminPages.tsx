@@ -5,6 +5,7 @@ import { Link, NavLink, useParams } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { CaseList, Documents, Field, RequestStatus } from '@/components/WorkflowUi'
 import { card, caseOpen, dateLabel, input, page, statusLabel } from '@/lib/workflowUi'
+import type { Citation } from '@/lib/api'
 import { adminApi, downloadCaseDocument, getPersona, type CaseDetail, type CaseDocument, type Risk } from '@/lib/api'
 
 type Props = { onLogout: () => void }
@@ -60,8 +61,8 @@ function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: () => void }
   const waitingCustomer = ['NEEDS_INFO', 'AWAITING_SIGNATURE'].includes(item.status)
   const [decision, setDecision] = useState<ReviewDecision>(waitingCustomer ? '' : 'continue')
   const [comments, setComments] = useState('')
-  const editableRisk = [2, 4].includes(item.stage) && !['PAUSED', 'NEEDS_INFO'].includes(item.status)
-  const [editRisk, setEditRisk] = useState(item.stage === 2 && !item.risk)
+  const editableRisk = !item.signedWorkflow && [2, 4].includes(item.stage) && !['PAUSED', 'NEEDS_INFO'].includes(item.status)
+  const [editRisk, setEditRisk] = useState(editableRisk && item.stage === 2 && !item.risk)
   const [tier, setTier] = useState<Risk['tier']>(item.risk?.tier ?? 'low')
   const [rationale, setRationale] = useState(item.risk?.rationale ?? '')
   const [evidence, setEvidence] = useState(item.risk?.evidence.join('\n') ?? '')
@@ -76,10 +77,11 @@ function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: () => void }
   })
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (decision === 'cancel' && !window.confirm('Cancel this application?')) return
+    if (decision === 'cancel' && !window.confirm(item.signedWorkflow ? 'Reject this application?' : 'Cancel this application?')) return
     review.mutate()
   }
 
+  const signedAction = ['Start agreement preparation', 'Generate agreement', 'Release agreement', '', 'Verify evidence and assess risk', 'Approve and complete onboarding'][item.stage]
   if (!caseOpen(item.status)) return null
   return <form className={`${card} space-y-4`} onSubmit={submit}>
     <h2 className="text-lg font-semibold">{item.status === 'ADMIN_REVIEW' ? item.currentStep : 'Bank action'}</h2>
@@ -87,10 +89,10 @@ function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: () => void }
     {waitingCustomer && <p className="text-sm text-muted-foreground">Waiting for the customer to {item.status === 'NEEDS_INFO' ? 'provide information' : 'sign the agreement'}.</p>}
     <Field label="Decision"><select className={input} value={decision} required onChange={event => setDecision(event.target.value as ReviewDecision)}>
       {waitingCustomer && <option value="" disabled>Choose an action</option>}
-      {!waitingCustomer && <option value="continue">{item.status === 'PAUSED' ? 'Resume' : item.stage === 8 ? 'Provision sandbox account' : item.stage === 5 ? 'Prepare sandbox agreement' : 'Continue'}</option>}
+      {!waitingCustomer && <option value="continue">{item.status === 'PAUSED' ? 'Resume' : item.signedWorkflow ? signedAction : item.stage === 8 ? 'Provision sandbox account' : item.stage === 5 ? 'Prepare sandbox agreement' : 'Continue'}</option>}
       {!['PAUSED', 'NEEDS_INFO'].includes(item.status) && <option value="pause">Pause</option>}
       {!['PAUSED', 'NEEDS_INFO'].includes(item.status) && <option value="request_info">Request information</option>}
-      <option value="cancel">Cancel application</option>
+      <option value="cancel">{item.signedWorkflow ? 'Reject application' : 'Cancel application'}</option>
     </select></Field>
     {editableRisk && decision !== 'cancel' && <>
       <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={editRisk} onChange={event => setEditRisk(event.target.checked)} />{item.risk ? 'Override the recorded assessment' : 'Enter a bank risk assessment'}</label>
@@ -109,8 +111,14 @@ function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: () => void }
       <textarea className={input} value={comments} onChange={event => setComments(event.target.value)} maxLength={4000} />
     </Field>
     <RequestStatus error={review.error} />
-    <Button type="submit" disabled={review.isPending || !decision}>{review.isPending ? 'Saving…' : 'Save decision'}</Button>
+    <Button type="submit" disabled={review.isPending || !decision}>{review.isPending ? 'Working…' : 'Save decision'}</Button>
   </form>
+}
+
+function CitationList({ sources }: { sources: Citation[] }) {
+  return <ul className="list-inside list-disc text-sm">{sources.map(source => <li key={source.id}>
+    {source.url ? <a href={source.url} target="_blank" rel="noreferrer" className="text-primary underline">{source.citation}</a> : source.citation}
+  </li>)}</ul>
 }
 
 export function AdminCasePage({ onLogout }: Props) {
@@ -131,7 +139,7 @@ export function AdminCasePage({ onLogout }: Props) {
     <Link to="/admin" className="text-sm text-primary hover:underline">Back to applications</Link>
     <RequestStatus pending={query.isPending} error={query.error} />
     {item && <>
-      <div><h1 className="text-3xl font-bold">{item.application.businessName}</h1><p className="mt-2 text-sm capitalize">{statusLabel(item.status)} · {item.currentStep}</p><p className="mt-1 text-xs text-muted-foreground">Application {item.id}</p></div>
+      <div><h1 className="text-3xl font-bold">{item.application.businessName}</h1><p className="mt-2 text-sm capitalize">{item.rejected ? 'rejected' : statusLabel(item.status)} · {item.currentStep}</p><p className="mt-1 text-xs text-muted-foreground">Application {item.id}</p></div>
       <div className="grid items-start gap-5 lg:grid-cols-2">
         <section className={card}>
           <h2 className="text-lg font-semibold">Application</h2>
@@ -142,14 +150,21 @@ export function AdminCasePage({ onLogout }: Props) {
         <section className={`${card} space-y-3`}>
           <h2 className="text-lg font-semibold">Risk assessment</h2>
           {item.risk ? <>
-            <p className="text-sm font-semibold capitalize">{item.risk.tier} risk · Policy v{item.risk.policyVersion} · Bank review</p>
+            <p className="text-sm font-semibold capitalize">{item.risk.tier} risk · Policy v{item.risk.policyVersion} · {item.risk.source === 'agent' ? 'Agent recommendation' : 'Bank review'}</p>
             <p className="whitespace-pre-wrap text-sm">{item.risk.rationale}</p>
             <ul className="grid gap-2 text-sm sm:grid-cols-3">{scores.map(({ key, label }) => <li className="rounded-md bg-muted p-2" key={key}>{label}: {item.risk?.[key]} / 5</li>)}</ul>
             <h3 className="text-sm font-semibold">Evidence</h3>
+            {item.risk.sources && <CitationList sources={item.risk.sources} />}
             <ul className="list-inside list-disc break-words text-sm">{item.risk.evidence.map((line, index) => <li key={index}>{line}</li>)}</ul>
             {item.risk.missingInputs.length > 0 && <><h3 className="text-sm font-semibold">Missing inputs</h3><ul className="list-inside list-disc text-sm">{item.risk.missingInputs.map((line, index) => <li key={index}>{line}</li>)}</ul></>}
           </> : <p className="text-sm text-muted-foreground">Assessment pending.</p>}
         </section>
+        {item.verification && <section className={`${card} space-y-3`}>
+          <h2 className="text-lg font-semibold">Signed agreement verification</h2>
+          <ul className="list-inside list-disc text-sm">{item.verification.findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>
+          {item.verification.missingInputs.length > 0 && <p className="text-sm">Missing evidence: {item.verification.missingInputs.join('; ')}</p>}
+          <CitationList sources={item.verification.sources} />
+        </section>}
         <section className={`${card} space-y-3`}><h2 className="text-lg font-semibold">Documents</h2><RequestStatus error={download.error} /><Documents documents={item.documents} download={document => download.mutate(document)} /></section>
         <section className={`${card} space-y-3`}>
           <h2 className="text-lg font-semibold">Sandbox actions</h2>
@@ -158,7 +173,7 @@ export function AdminCasePage({ onLogout }: Props) {
             <p className="font-medium">{statusLabel(action.target)} · {action.state}</p><p className="text-xs">{action.reference}</p><p>{action.evidence}</p>{action.state === 'conflict' && <p className="mt-1 text-destructive">The target record needs operator review.</p>}
           </li>)}</ul> : <p className="text-sm text-muted-foreground">No sandbox actions recorded.</p>}
           <RequestStatus error={retry.error} />
-          {['DOCUMENT_GENERATION', 'PROVISIONING', 'VERIFYING'].includes(item.status) && item.actions.some(action => action.state !== 'verified') && <Button variant="outline" disabled={retry.isPending} onClick={() => retry.mutate()}>Retry sandbox action</Button>}
+          {!item.signedWorkflow && ['DOCUMENT_GENERATION', 'PROVISIONING', 'VERIFYING'].includes(item.status) && item.actions.some(action => action.state !== 'verified') && <Button variant="outline" disabled={retry.isPending} onClick={() => retry.mutate()}>Retry sandbox action</Button>}
         </section>
         <section className={`${card} space-y-3`}>
           <h2 className="text-lg font-semibold">Audit history</h2>

@@ -28,6 +28,19 @@ RISK_POLICY = {
 }
 
 
+SIGNED_WORKFLOW = "signed-agreement-v1"
+SIGNED_STEPS = ("Apply", "Prepare agreement", "Document Review", "Sign and return", "Verify evidence", "Final bank review", "Onboard")
+SIGNED_STATES = ("APPLIED", "DOCUMENT_GENERATION", "ADMIN_REVIEW", "AWAITING_SIGNATURE", "VERIFYING", "ADMIN_REVIEW", "ONBOARDED")
+
+
+def uses_signed_workflow(record):
+    return record.get("workflow") == SIGNED_WORKFLOW
+
+
+def workflow_steps(record):
+    return SIGNED_STEPS if uses_signed_workflow(record) else STEPS
+
+
 def now():
     return datetime.now(timezone.utc)
 
@@ -36,18 +49,22 @@ def progress(record):
     index = record.get("stage", 0)
     status = case_status(record)
     team = "Customer Onboarding" if index in {0, 7, 9} else "Business Banking Operations"
-    minutes = sum(DURATIONS[index:])
+    steps = workflow_steps(record)
+    minutes = sum((0, 10, 20, 10, 15, 20, 0)[index:]) if uses_signed_workflow(record) else sum(DURATIONS[index:])
     waiting = status in {"NEEDS_INFO", "PAUSED", "ADMIN_REVIEW", "AWAITING_SIGNATURE"}
-    complete = len(STEPS) if status == "ONBOARDED" else index
+    complete = len(steps) if status == "ONBOARDED" else index
     return {
         "id": str(record["_id"]),
         "conversationId": record.get("client_id"),
         "status": status,
         "stage": index,
-        "currentStep": STEPS[index],
-        "steps": list(STEPS),
+        "currentStep": steps[index],
+        "steps": list(steps),
         "completed": complete,
         "revision": record.get("revision", 0),
+        "signedWorkflow": uses_signed_workflow(record),
+        "agreementSigned": bool(record.get("agreement_signed")),
+        "rejected": bool(record.get("rejected")),
         "submittedAt": record.get("submitted_at"),
         "application": record.get("application", {}),
         "requiredDocuments": record.get("required_documents", []),
@@ -90,6 +107,6 @@ def transition(row, decision, comments):
 
 def case_status(record):
     # Older Atlas validators omit PROVISIONING. Stage eight represents that state.
-    if record.get("stage") == 8 and record["status"] == "AWAITING_SIGNATURE":
+    if not uses_signed_workflow(record) and record.get("stage") == 8 and record["status"] == "AWAITING_SIGNATURE":
         return "PROVISIONING"
     return record["status"]
