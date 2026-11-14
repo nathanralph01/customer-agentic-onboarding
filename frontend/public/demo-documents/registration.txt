@@ -1,0 +1,15 @@
+CUSTOMER 360 DEMO | FICTIONAL REGISTRATION RECORD
+Sandbox evidence only. No government authority issued this record.
+
+Legal name: Cedar Finch Office Supplies Ltd.
+Entity type: Canadian private corporation
+Jurisdiction: Ontario, Canada
+Demo registration reference: DEMO-ON-CF-001
+Demo incorporation date: 2024-04-12
+Registered office: 10 Demo Cedar Lane, Ottawa, Ontario, Canada (fictional)
+Status in demo registry: Active
+Directors: Jordan Vale and Taylor Reed
+Business activity: Online retail of office supplies to Canadian businesses
+Requested product: Business account
+Expected activity: Domestic CAD electronic payments with no routine cash or cross-border activity
+Record prepared for the Customer 360 sandbox demonstration.

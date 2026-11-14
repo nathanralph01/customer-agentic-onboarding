@@ -55,11 +55,12 @@ export function ApplicationPage({ onLogout }: Props) {
                 rows={key === 'owners' || key === 'businessActivity' ? 3 : 1} value={form[key]}
                 onChange={event => setForm(current => ({ ...current, [key]: event.target.value }))} />
             </Field>
+            {key === 'products' && <p className="mt-1 text-sm text-muted-foreground">Choose Business account, Payments, or Credit facility. Payments and Credit facility require a Business account.</p>}
             {invalid && <p id={`${key}-error`} className="mt-1 text-sm text-destructive">This field is required.</p>}
           </div>
         })}
         {showErrors && missingFields.length > 0 && <p role="alert" className="text-sm text-destructive">Complete the required fields to continue.</p>}
-        <RequestStatus error={submit.error} />
+        <RequestStatus pending={submit.isPending} label="Submitting application…" error={submit.error} />
         <div className="flex flex-wrap gap-3">
           {step > 0 && <Button type="button" variant="outline" onClick={() => { setShowErrors(false); setStep(step - 1) }} disabled={submit.isPending}>Back</Button>}
           <Button type="submit" disabled={submit.isPending}>{submit.isPending ? 'Submitting…' : step === fields.length - 1 ? 'Submit application' : 'Continue'}</Button>
@@ -123,7 +124,8 @@ export function CustomerCasePage({ onLogout }: Props) {
           <p className="mt-4 text-sm">{item.estimatedCompletion ? `Estimated completion: ${dateLabel(item.estimatedCompletion)}` : item.estimatedMinutes !== null ? `About ${item.estimatedMinutes} minutes of processing after the current handoff.` : ''}</p>
           <p className="mt-2 text-sm text-muted-foreground">{item.contact.name} · <a className="underline" href={`mailto:${item.contact.email}`}>{item.contact.email}</a> · <a className="underline" href={`tel:${item.contact.phone}`}>{item.contact.phone}</a></p>
         </section>
-        <RequestStatus error={mutation.error || download.error} />
+        <RequestStatus pending={mutation.isPending} label={mutation.variables === 'info' ? 'Sending information…' : mutation.variables === 'sign'
+          ? 'Saving signature…' : mutation.variables === 'return' ? 'Returning signed agreement…' : 'Uploading document…'} error={mutation.error || download.error} />
         {item.requestedInformation && <form className={`${card} space-y-3`} onSubmit={event => { event.preventDefault(); mutation.mutate('info') }}>
           <h2 className="text-lg font-semibold">Information requested</h2>
           <p className="whitespace-pre-wrap text-sm">{item.requestedInformation}</p>
@@ -134,7 +136,7 @@ export function CustomerCasePage({ onLogout }: Props) {
           <h2 className="text-lg font-semibold">Application documents</h2>
           {item.requiredDocuments.length > 0 && <p className="text-sm text-muted-foreground">Requested documents: {item.requiredDocuments.join(', ')}.</p>}
           <RequestStatus pending={documents.isPending} error={documents.error} />
-          {documents.data && <Documents documents={documents.data} download={document => download.mutate(document)} />}
+          {documents.data && <Documents documents={documents.data} downloading={download.isPending ? download.variables?.id : undefined} download={document => download.mutate(document)} />}
           {caseOpen(item.status) && !(item.signedWorkflow && item.stage === 5) && <>
             <input ref={fileInput} type="file" accept=".pdf,.docx,.txt,.csv,.png,.jpg,.jpeg" aria-label="Upload supporting document" className="sr-only" tabIndex={-1} onChange={event => {
               const file = event.target.files?.[0]

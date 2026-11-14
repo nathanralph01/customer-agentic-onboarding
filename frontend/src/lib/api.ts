@@ -57,6 +57,10 @@ export function createConversation(conversation: ConversationDraft): Promise<Con
   })
 }
 
+export function discardConversation(id: string): Promise<{ deleted: boolean }> {
+  return request(`/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
 export function sendChatMessage(id: string, message: ChatMessage): Promise<Conversation> {
   return request(`/conversations/${encodeURIComponent(id)}/chat`, {
     method: 'POST',
@@ -113,9 +117,9 @@ export type Risk = {
   tier: 'low' | 'medium' | 'high'; rationale: string; evidence: string[]; missingInputs: string[]
   ownership: number; activity: number; geography: number; policyVersion?: number
 }
-export type CaseDocument = OnboardingDocument & { source: string; coverNote?: string | null }
+export type CaseDocument = OnboardingDocument & { source: string; coverNote?: string | null; pricing?: { version: string; currency: string; products: { name: string; terms: string[] }[] } | null }
 export type CaseDetail = Case & {
-  verification?: { findings: string[]; missingInputs: string[]; sources: Citation[] };
+  verification?: { retrieval?: string; findings: string[]; missingInputs: string[]; sources: Citation[] };
   risk: Risk | null; documents: CaseDocument[]; checkpoint: { step: string; revision: number }
   history: { action: string; from: string | null; to: string; role: string; reason: string; created_at: string }[]
   actions: { id: string; target: string; state: string; reference?: string; evidence?: string }[]

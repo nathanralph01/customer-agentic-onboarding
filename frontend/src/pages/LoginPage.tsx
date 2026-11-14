@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight, Building2, ShieldCheck } from 'lucide-react'
 import { Link } from 'react-router-dom'
+import { RequestStatus } from '@/components/WorkflowUi'
 import { Button } from '@/components/ui/button'
 import { listPersonas, type Persona } from '@/lib/api'
 
@@ -13,7 +14,7 @@ export default function LoginPage({ onLogin }: { onLogin: (persona: Persona) => 
       <h1 className="mt-7 text-3xl font-bold tracking-tight">Choose a demo persona</h1>
       <p className="mt-2 text-sm text-muted-foreground">Use synthetic data in the customer and bank workspaces.</p>
       <div className="mt-6 grid gap-3">
-        {isPending && <p role="status">Loading personas…</p>}
+        <RequestStatus pending={isPending} label="Loading demo personas…" />
         {error && <><p role="alert" className="text-destructive">{error.message}</p><Button variant="outline" onClick={() => refetch()}>Try again</Button></>}
         {data?.map(persona => {
           const Icon = persona.role === 'customer' ? Building2 : ShieldCheck

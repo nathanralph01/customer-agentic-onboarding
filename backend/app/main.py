@@ -197,15 +197,20 @@ async def _save_answer(
     customer_id: ObjectId,
     sequence: int,
     content: str,
+    *,
+    onboarding: dict | None = None,
+    answers: list[str] | None = None,
+    clear_pending: bool = False,
 ) -> list[str]:
-    onboarding = await database["onboardings"].find_one(
-        {"_id": conversation["onboarding_id"], "customer_id": customer_id},
-    )
-    if onboarding is None or onboarding["status"] != "DRAFT":
+    if onboarding is None:
+        onboarding = await database["onboardings"].find_one(
+            {"_id": conversation["onboarding_id"], "customer_id": customer_id},
+        )
+    if onboarding is None or onboarding["status"] != "DRAFT" or onboarding.get("discarding"):
         raise HTTPException(409, "This draft has already been submitted.")
     messages = database["messages"]
     query = {"conversation_id": conversation["_id"], "sequence": sequence}
-    answers = await _read_answers(database, conversation["_id"])
+    answers = (await _read_answers(database, conversation["_id"])) if answers is None else list(answers)
     if sequence < len(answers):
         if answers[sequence] != content:
             raise HTTPException(409, "This answer sequence was already saved with different content.")
@@ -236,10 +241,11 @@ async def _save_answer(
     now = datetime.now(timezone.utc)
     fields = ("legal_name", "business_activity", "registration_location", "ownership_description", "banking_needs")
     application = dict(zip(fields, answers))
+    writes = []
     if conversation.get("owner_customer_id") and application:
         profile = {field: application[field] for field in fields[:4] if field in application}
-        await database["customers"].update_one({"_id": customer_id}, {"$set": {**profile, "updated_at": now}})
-    await database["onboardings"].update_one(
+        writes.append(database["customers"].update_one({"_id": customer_id}, {"$set": {**profile, "updated_at": now}}))
+    writes.append(database["onboardings"].update_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id, "status": "DRAFT"},
         {
             "$set": {
@@ -249,14 +255,20 @@ async def _save_answer(
                 "updated_at": now,
             }
         },
-    )
+    ))
+    # Keep pending_answer until both projections have been persisted.
+    results = await asyncio.gather(*writes, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
     await database["conversations"].update_one(
         {"_id": conversation["_id"]},
         {
             "$set": {
                 "title": answers[0] if answers else "Business onboarding",
                 "updated_at": now,
-            }
+            },
+            **({"$unset": {"pending_answer": ""}} if clear_pending else {}),
         },
     )
 
@@ -397,18 +409,19 @@ async def save_conversation_answer(
     return _conversation_response(conversation, answers)
 
 
-async def _chat_response(database, conversation, customer_id):
+async def _chat_response(database, conversation, customer_id, *, onboarding=None, answers=None):
     if not conversation.get("application_submitted"):
-        onboarding = await database["onboardings"].find_one({"_id": conversation["onboarding_id"]})
+        if onboarding is None:
+            onboarding = await database["onboardings"].find_one({"_id": conversation["onboarding_id"]})
         if onboarding and onboarding["status"] != "DRAFT":
             conversation = {**conversation, "application_submitted": True}
-        elif turn := conversation.get("pending_answer"):
-            answers = await _save_answer(database, conversation, customer_id, turn["sequence"], turn["answer"])
-            await database.conversations.update_one(
-                {"_id": conversation["_id"]}, {"$unset": {"pending_answer": ""}},
+        elif not (onboarding or {}).get("discarding") and (turn := conversation.get("pending_answer")):
+            answers = await _save_answer(
+                database, conversation, customer_id, turn["sequence"], turn["answer"],
+                onboarding=onboarding, answers=answers, clear_pending=True,
             )
-            return _conversation_response(conversation, answers)
-    answers = await _read_answers(database, conversation["_id"])
+    if answers is None:
+        answers = await _read_answers(database, conversation["_id"])
     return _conversation_response(conversation, answers)
 
 
@@ -434,7 +447,13 @@ async def send_chat_message(conversation_id: UUID, payload: ChatPayload, request
             raise HTTPException(status_code=409, detail="This conversation changed. Reload it and try again.")
         return True
 
-    response = await _chat_response(database, conversation, customer_id)
+    onboarding, answers = await asyncio.gather(
+        database.onboardings.find_one({"_id": conversation["onboarding_id"]}),
+        _read_answers(database, conversation["_id"]),
+    )
+    if onboarding is None or onboarding.get("discarding"):
+        raise HTTPException(409, "This draft is being discarded.")
+    response = await _chat_response(database, conversation, customer_id, onboarding=onboarding, answers=answers)
     if not current_turn(conversation, response.answers):
         return response
     if response.applicationId:
@@ -454,30 +473,33 @@ async def send_chat_message(conversation_id: UUID, payload: ChatPayload, request
             detail="The onboarding guide is unavailable. Your message can be retried.",
         ) from None
 
+    turn = {
+        "id": turn_id, "sequence": payload.sequence, "content": content,
+        "clarification": decision.reply,
+    }
+    pending = {"answer": decision.answer, "sequence": payload.sequence}
     await database.conversations.update_one(
         {"_id": conversation["_id"]},
         {
             "$inc": {"chat_revision": 1},
             "$set": {
                 "updated_at": datetime.now(timezone.utc),
-                **({"pending_answer": {"answer": decision.answer, "sequence": payload.sequence}}
-                   if decision.action == "accept" else {}),
+                **({"pending_answer": pending} if decision.action == "accept" else {}),
             },
-            "$push": {
-                "chat_turns": {
-                    "$each": [{
-                        "id": turn_id,
-                        "sequence": payload.sequence,
-                        "content": content,
-                        "clarification": decision.reply,
-                    }],
-                    "$slice": -50,
-                },
-            },
+            "$push": {"chat_turns": {"$each": [turn], "$slice": -50}},
         },
     )
-    saved = await database.conversations.find_one({"_id": conversation["_id"]})
-    return await _chat_response(database, saved, customer_id)
+    saved = {
+        **conversation,
+        "chat_revision": payload.revision + 1,
+        "chat_turns": [*conversation.get("chat_turns", []), turn][-50:],
+    }
+    if decision.action == "accept":
+        saved["pending_answer"] = pending
+        return await _chat_response(
+            database, saved, customer_id, onboarding=onboarding, answers=response.answers,
+        )
+    return _conversation_response(saved, response.answers)
 
 
 @app.get(
@@ -497,7 +519,9 @@ async def list_documents(conversation_id: UUID, request: Request):
 
 async def check_conversation_upload_allowed(database, conversation):
     record = await database.onboardings.find_one({"_id": conversation["onboarding_id"]})
-    if record and record.get("workflow") == "signed-agreement-v1" and record.get("stage", 0) >= 5:
+    if not record or record.get("discarding"):
+        raise HTTPException(409, "This draft is being discarded.")
+    if record.get("workflow") == "signed-agreement-v1" and record.get("stage", 0) >= 5:
         raise HTTPException(409, "The evidence is locked for final bank review.")
 
 
@@ -517,6 +541,46 @@ async def upload_document(
     await check_conversation_upload_allowed(database, conversation)
     customer_id = conversation["customer_id"]
     return await store_upload(database, customer_id, conversation["onboarding_id"], file, conversation["_id"])
+
+
+@app.delete("/api/v1/conversations/{conversation_id}")
+async def discard_draft(conversation_id: UUID, request: Request):
+    database = get_database(request)
+    owner_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
+    conversation = await database.conversations.find_one({
+        "client_id": str(conversation_id), **customer_scope(owner_id),
+    })
+    if conversation is None:
+        return {"deleted": True}
+
+    onboarding_id = conversation["onboarding_id"]
+    onboarding = await database.onboardings.find_one({"_id": onboarding_id, "customer_id": conversation["customer_id"]})
+    if conversation.get("application_submitted") or (onboarding and onboarding["status"] != "DRAFT"):
+        raise HTTPException(409, "Submitted applications cannot be discarded from chat.")
+    if onboarding:
+        await database.onboardings.update_one(
+            {"_id": onboarding_id, "status": "DRAFT"}, {"$set": {"discarding": True}},
+        )
+
+    documents = await database.documents.find({"onboarding_id": onboarding_id})
+    bucket = MCPBucket(database)
+    for document in documents:
+        await bucket.delete(document["storage_id"], missing_ok=True)
+        await database.documents.delete_one({"_id": document["_id"]})
+    await database.call("delete-many", "messages", filter={"conversation_id": conversation["_id"]})
+
+    # Only remove records created solely for this draft. Legacy chats share a profile.
+    client_id = str(conversation_id)
+    customer_id = conversation["customer_id"]
+    if customer_id == ObjectId(sha256(f"customer:{client_id}".encode()).digest()[:12]):
+        user_id = ObjectId(sha256(f"applicant:{client_id}".encode()).digest()[:12])
+        await database.users.delete_one({"_id": user_id, "customer_id": customer_id, "email": f"{client_id}@applicant.invalid"})
+        await database.customers.delete_one({"_id": customer_id, "onboarding_client_id": client_id})
+
+    await database.onboardings.delete_one({"_id": onboarding_id, "status": "DRAFT"})
+    # Keep the conversation until cleanup succeeds so a failed request can be retried.
+    await database.conversations.delete_one({"_id": conversation["_id"]})
+    return {"deleted": True}
 
 
 @app.get("/api/v1/documents/{document_id}/download")

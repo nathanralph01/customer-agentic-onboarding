@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { ArrowLeft, Bot, Check, Download, History, MessageSquare, Plus, Send, FileText, Upload, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
+import { ConfirmDialog, RequestStatus } from '@/components/WorkflowUi'
 import CustomerLayout from '@/components/CustomerLayout'
 import { Button, buttonVariants } from '@/components/ui/button'
 import {
   createConversation,
+  discardConversation,
   downloadDocument,
   listConversations,
   listDocuments,
@@ -44,6 +46,10 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [confirmCancel, setConfirmCancel] = useState(false)
+  const [outgoing, setOutgoing] = useState<{ conversationId: string; content: string; failed: boolean } | null>(null)
+  const [savingLabel, setSavingLabel] = useState('')
+  const [downloading, setDownloading] = useState<string | null>(null)
   const [apiError, setApiError] = useState('')
   const [loadAttempt, setLoadAttempt] = useState(0)
   const [documents, setDocuments] = useState<Record<string, OnboardingDocument[]>>({})
@@ -56,7 +62,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const initialConversation = useRef<ConversationDraft | null>(null)
   const pendingMessage = useRef<{ conversationId: string; message: ChatMessage } | null>(null)
-  const active = conversations.find(item => item.id === activeId) || conversations[0]
+  const active = conversations.find(item => item.id === activeId)
 
   useEffect(() => {
     let cancelled = false
@@ -114,7 +120,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   useEffect(() => {
     const log = logRef.current
     if (log && tab === 'chat' && activeId !== null) log.scrollTop = log.scrollHeight
-  }, [active?.revision, activeId, tab])
+  }, [active?.revision, activeId, tab, outgoing])
 
   async function send(event?: FormEvent) {
     event?.preventDefault()
@@ -125,21 +131,33 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
       ? pending.message
       : { id: crypto.randomUUID(), revision: active.revision, sequence: active.answers.length, content }
     pendingMessage.current = { conversationId: active.id, message }
+    setOutgoing({ conversationId: active.id, content, failed: false })
+    setDraft('')
     setSaving(true)
     setApiError('')
     try {
       const saved = await sendChatMessage(active.id, message)
       setConversations(current => current.map(item => item.id === saved.id ? saved : item))
       pendingMessage.current = null
+      setOutgoing(null)
       setDraft('')
       inputRef.current?.focus()
     } catch (error) {
+      setOutgoing({ conversationId: active.id, content, failed: true })
+      setDraft(content)
       setApiError(error instanceof Error ? error.message : 'Unable to send your message.')
       if (error instanceof ApiError && error.status === 409) {
         pendingMessage.current = null
         try {
           const latest = (await listConversations()).find(item => item.id === active.id)
-          if (latest) setConversations(current => current.map(item => item.id === latest.id ? latest : item))
+          if (latest) {
+            setConversations(current => current.map(item => item.id === latest.id ? latest : item))
+            if (latest.turns.some(turn => turn.id === message.id)) {
+              setOutgoing(null)
+              setDraft('')
+              setApiError('')
+            }
+          }
         } catch {
           setApiError('Unable to reload the conversation. Refresh the page and try again.')
         }
@@ -158,6 +176,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
 
   async function startNew() {
     const next = newConversation()
+    setSavingLabel('Creating conversation…')
     setSaving(true)
     setApiError('')
     try {
@@ -165,12 +184,43 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
       setConversations(current => [saved, ...current])
       setActiveId(saved.id)
       setDocumentError('')
+      setOutgoing(null)
       setDraft('')
       setTab('chat')
     } catch (error) {
       setApiError(error instanceof Error ? error.message : 'Unable to create a conversation in Atlas.')
     } finally {
       setSaving(false)
+      setSavingLabel('')
+    }
+  }
+
+  async function cancelOnboarding() {
+    if (!active || active.applicationId || saving || documentBusy) return
+    setConfirmCancel(false)
+    setSavingLabel('Deleting draft…')
+    setSaving(true)
+    setApiError('')
+    try {
+      await discardConversation(active.id)
+      if (initialConversation.current?.id === active.id) initialConversation.current = null
+      pendingMessage.current = null
+      setConversations(current => current.filter(item => item.id !== active.id))
+      setDocuments(current => {
+        const remaining = { ...current }
+        delete remaining[active.id]
+        return remaining
+      })
+      setActiveId(null)
+      setOutgoing(null)
+      setDraft('')
+      setDocumentError('')
+      setTab('chat')
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : 'Unable to cancel onboarding.')
+    } finally {
+      setSaving(false)
+      setSavingLabel('')
     }
   }
 
@@ -231,6 +281,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   }
 
   async function downloadStoredDocument(document: OnboardingDocument) {
+    setDownloading(document.id)
     try {
       const blob = await downloadDocument(document.id)
       const url = URL.createObjectURL(blob)
@@ -241,6 +292,8 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
       window.setTimeout(() => URL.revokeObjectURL(url), 1000)
     } catch (error) {
       setDocumentError(error instanceof Error ? error.message : 'Unable to download the document.')
+    } finally {
+      setDownloading(null)
     }
   }
 
@@ -260,7 +313,10 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
   if (loading || !active) return <CustomerLayout onLogout={onLogout} onboarding>
     <main className="mx-auto w-full max-w-[1600px] px-[clamp(1.1rem,3vw,3.3rem)] py-5">
       <Link to="/customer" className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-primary"><ArrowLeft className="size-4" aria-hidden="true" />Back to overview</Link>
-      {apiError ? <div role="alert" className="mt-6 rounded-xl border border-destructive/40 bg-destructive/5 p-5"><p className="text-sm">{apiError}</p><Button variant="outline" className="mt-3" onClick={() => setLoadAttempt(attempt => attempt + 1)}>Retry</Button></div> : <p role="status" className="mt-6 text-sm text-muted-foreground">Loading your onboarding from Atlas…</p>}
+      {apiError ? <div role="alert" className="mt-6 rounded-xl border border-destructive/40 bg-destructive/5 p-5"><p className="text-sm">{apiError}</p><Button variant="outline" className="mt-3" onClick={() => setLoadAttempt(attempt => attempt + 1)}>Retry</Button></div> : loading ? <div className="mt-6"><RequestStatus pending label="Loading your onboarding from Atlas…" /></div> : <div className="mt-6 flex flex-wrap gap-3">
+        <Button disabled={saving} onClick={startNew}><Plus aria-hidden="true" />{saving ? 'Creating conversation…' : 'Start new conversation'}</Button>
+        {conversations.length > 0 && <Button variant="outline" disabled={saving} onClick={() => { setActiveId(conversations[0].id); setTab('history') }}>Past conversations</Button>}
+      </div>}
     </main>
   </CustomerLayout>
 
@@ -288,10 +344,16 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
               <Button type="button" variant="outline" size="sm" onClick={startNew} disabled={saving}>
                 <Plus aria-hidden="true" />Start new conversation
               </Button>
+              {!active.applicationId && <Button type="button" variant="ghost" size="sm" className="text-destructive" onClick={() => setConfirmCancel(true)} disabled={saving || documentBusy}>Cancel onboarding</Button>}
             </div>
           </div>
           <div ref={logRef} role="log" aria-label="Onboarding conversation" aria-live="polite" className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain px-5 py-4">
             <OnboardingTranscript conversation={active} />
+            {outgoing?.conversationId === active.id && <div className="space-y-3">
+              <CustomerMessage>{outgoing.content}</CustomerMessage>
+              <p className="text-right text-xs text-muted-foreground">{outgoing.failed ? 'Delivery unconfirmed. You can retry below.' : 'Sent · awaiting reply'}</p>
+              {!outgoing.failed && <RequestStatus pending label={active.agentEnabled ? 'Onboarding guide is thinking…' : 'Onboarding guide is replying…'} />}
+            </div>}
             {complete && <div className="rounded-xl border bg-muted/40 p-5"><h3 className="flex items-center gap-2 font-semibold"><Check className="size-4 text-primary" aria-hidden="true" />Your business details</h3><dl className="mt-4 space-y-3">{active.answers.map((answer, index) => <div key={active.fields[index]}><dt className="text-xs font-medium text-muted-foreground">{active.fields[index]}</dt><dd className="mt-1 text-sm whitespace-pre-wrap break-words">{answer}</dd></div>)}</dl></div>}
           </div>
           <div className="shrink-0 border-t bg-muted/20 px-5 py-3">
@@ -316,10 +378,12 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
             <input ref={fileInputRef} type="file" multiple accept=".pdf,.docx,.txt,.csv,.png,.jpg,.jpeg" aria-label="Choose company documents" aria-describedby="document-types" className="hidden" onChange={event => { addDocuments(event.target.files); event.target.value = '' }} />
             <Button variant="outline" className="mt-3" disabled={!documentsLoaded || documentBusy || activeDocuments.length >= 10} onClick={() => fileInputRef.current?.click()}>{documentBusy ? 'Saving…' : 'Choose files'}</Button>
           </div>
+          <RequestStatus pending={!!downloading || documentBusy} label={downloading ? 'Downloading document…' : 'Saving document changes…'} />
           {documentError && <div className="mt-3">
             <p role="alert" className="text-sm text-destructive">{documentError}</p>
             {!documentsLoaded && <Button variant="outline" size="sm" onClick={() => { setDocumentError(''); setDocumentLoadAttempt(attempt => attempt + 1) }}>Retry documents</Button>}
           </div>}
+          <p className="mt-3 text-sm"><a className="text-primary underline" href={`${import.meta.env.BASE_URL}demo-documents/registration.txt`} download>Sample registration record</a> · <a className="text-primary underline" href={`${import.meta.env.BASE_URL}demo-documents/ownership.txt`} download>Sample ownership register</a></p>
           <p className="mt-3 text-xs text-muted-foreground">Documents are stored in Atlas and can be downloaded or removed. Document review is outside this intake step. Use synthetic documents only.</p>
           <div className="mt-5">
             <h3 className="text-sm font-semibold">Attached to this conversation</h3>
@@ -328,7 +392,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
               <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium" title={document.filename}>{document.filename}</p><p className="mt-1 text-xs text-muted-foreground">{document.sizeBytes < 1024 * 1024 ? `${Math.ceil(document.sizeBytes / 1024)} KB` : `${(document.sizeBytes / (1024 * 1024)).toFixed(1)} MB`} · Stored in Atlas</p></div>
               <Button variant="ghost" aria-label={`Download ${document.filename}`} disabled={documentBusy} onClick={() => downloadStoredDocument(document)}><Download aria-hidden="true" /></Button>
               <Button variant="ghost" aria-label={`Remove ${document.filename}`} disabled={documentBusy} onClick={() => removeStoredDocument(document)}><X aria-hidden="true" /></Button>
-            </li>)}</ul> : <p role="status" className="mt-2 text-sm text-muted-foreground">{documentsLoaded ? 'No documents added yet.' : documentError ? 'Documents unavailable.' : 'Loading documents…'}</p>}
+            </li>)}</ul> : (documentsLoaded ? <p className="mt-2 text-sm text-muted-foreground">No documents added yet.</p> : <RequestStatus pending={!documentError} label="Loading documents…" />)}
           </div>
         </section>
 
@@ -337,6 +401,9 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
           <ul className="mt-6 space-y-3">{conversations.map(item => <li key={item.id}><button type="button" disabled={saving} onClick={() => { setActiveId(item.id); setDocumentError(''); setDraft(''); setTab('chat') }} className="flex w-full flex-wrap items-center justify-between gap-3 rounded-xl border p-4 text-left outline-none hover:border-primary/40 hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-ring"><div className="min-w-0"><p className="font-medium break-words">{item.answers[0] || 'New business onboarding'}</p><p className="mt-1 text-xs text-muted-foreground">{new Date(item.startedAt).toLocaleString()} · {item.answers.length} of {item.fields.length} questions answered</p></div><span className="rounded-full bg-secondary px-3 py-1 text-xs font-medium text-secondary-foreground">{item.id === active.id ? 'Current' : item.answers.length === item.fields.length ? 'Draft complete' : 'In progress'}</span></button></li>)}</ul>
         </section>
       </div>
+      <RequestStatus pending={!!savingLabel} label={savingLabel} />
+      {confirmCancel && <ConfirmDialog title="Cancel onboarding?" description="This permanently deletes the draft, its answers, and its uploaded documents."
+        action="Delete draft" onClose={() => setConfirmCancel(false)} onConfirm={cancelOnboarding} />}
       {apiError && <p role="alert" className="mt-3 text-sm text-destructive">{apiError}</p>}
     </main>
   </CustomerLayout>

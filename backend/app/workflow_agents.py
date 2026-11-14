@@ -2,6 +2,7 @@
 
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -26,15 +27,25 @@ class RiskRecommendation(EvidenceCheck):
     geography: int = Field(ge=1, le=5)
 
 
-def run_skill(skill: str, schema: type[BaseModel], context: dict):
+class FinalAssessment(BaseModel):
+    verification: EvidenceCheck
+    risk: RiskRecommendation
+
+
+@lru_cache(maxsize=4)
+def structured_model(model: str, schema: type[BaseModel]):
     from langchain.chat_models import init_chat_model
 
+    return init_chat_model(model, timeout=40, max_retries=1).with_structured_output(schema)
+
+
+def run_skill(skill: str, schema: type[BaseModel], context: dict):
     model = os.getenv("ONBOARDING_CHAT_MODEL")
     if not model:
         raise ValueError("Configure ONBOARDING_CHAT_MODEL before running the workflow agents.")
     skill_file = Path(__file__).parent / "skills" / skill / "SKILL.md"
     instruction = skill_file.read_text(encoding="utf-8").split("---", 2)[2].strip()
-    result = init_chat_model(model, timeout=40).with_structured_output(schema).invoke([
+    result = structured_model(model, schema).invoke([
         ("system", instruction),
         ("human", json.dumps(context, default=str)),
     ])
