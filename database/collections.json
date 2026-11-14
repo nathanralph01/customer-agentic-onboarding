@@ -1,0 +1,548 @@
+[
+  {
+    "name": "users",
+    "category": "core",
+    "validator": {
+      "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+          "name",
+          "email",
+          "role"
+        ],
+        "properties": {
+          "_id": {
+            "bsonType": "objectId"
+          },
+          "created_at": {
+            "bsonType": "date"
+          },
+          "updated_at": {
+            "bsonType": "date"
+          },
+          "name": {
+            "bsonType": "string"
+          },
+          "email": {
+            "bsonType": "string"
+          },
+          "role": {
+            "bsonType": "string",
+            "enum": [
+              "admin",
+              "customer"
+            ]
+          },
+          "customer_id": {
+            "bsonType": "objectId"
+          }
+        }
+      }
+    },
+    "indexes": [
+      {
+        "keys": {
+          "email": 1
+        },
+        "unique": true
+      },
+      {
+        "keys": {
+          "customer_id": 1
+        }
+      }
+    ]
+  },
+  {
+    "name": "customers",
+    "category": "core",
+    "validator": {
+      "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+          "legal_name"
+        ],
+        "properties": {
+          "_id": {
+            "bsonType": "objectId"
+          },
+          "created_at": {
+            "bsonType": "date"
+          },
+          "updated_at": {
+            "bsonType": "date"
+          },
+          "legal_name": {
+            "bsonType": "string"
+          },
+          "registration_number": {
+            "bsonType": "string"
+          },
+          "industry": {
+            "bsonType": "string"
+          },
+          "address": {
+            "bsonType": "object"
+          },
+          "contact": {
+            "bsonType": "object"
+          },
+          "owners": {
+            "bsonType": "array",
+            "items": {
+              "bsonType": "object",
+              "properties": {
+                "name": {
+                  "bsonType": "string"
+                },
+                "ownership_percentage": {
+                  "bsonType": [
+                    "double",
+                    "int",
+                    "long",
+                    "decimal"
+                  ],
+                  "minimum": 0,
+                  "maximum": 100
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "indexes": [
+      {
+        "keys": {
+          "legal_name": 1
+        }
+      }
+    ]
+  },
+  {
+    "name": "onboardings",
+    "category": "core",
+    "validator": {
+      "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+          "customer_id",
+          "created_by",
+          "status"
+        ],
+        "properties": {
+          "_id": {
+            "bsonType": "objectId"
+          },
+          "created_at": {
+            "bsonType": "date"
+          },
+          "updated_at": {
+            "bsonType": "date"
+          },
+          "customer_id": {
+            "bsonType": "objectId"
+          },
+          "created_by": {
+            "bsonType": "objectId"
+          },
+          "status": {
+            "bsonType": "string",
+            "enum": [
+              "DRAFT",
+              "APPLIED",
+              "VERIFYING",
+              "NEEDS_INFO",
+              "RISK_ASSESSMENT",
+              "COMPLIANCE_CHECK",
+              "DOCUMENT_GENERATION",
+              "ADMIN_REVIEW",
+              "AWAITING_SIGNATURE",
+              "ONBOARDED",
+              "PAUSED",
+              "CANCELLED"
+            ]
+          },
+          "current_step": {
+            "bsonType": "string"
+          },
+          "application": {
+            "bsonType": "object"
+          },
+          "requested_products": {
+            "bsonType": "array",
+            "items": {
+              "bsonType": "string"
+            }
+          },
+          "requirements_id": {
+            "bsonType": "objectId"
+          },
+          "requirements_version": {
+            "bsonType": "int",
+            "minimum": 1
+          },
+          "submitted_at": {
+            "bsonType": "date"
+          }
+        }
+      }
+    },
+    "indexes": [
+      {
+        "keys": {
+          "customer_id": 1,
+          "created_at": -1
+        }
+      },
+      {
+        "keys": {
+          "status": 1,
+          "updated_at": -1
+        }
+      },
+      {
+        "keys": {
+          "client_id": 1
+        },
+        "unique": true,
+        "partialFilterExpression": {
+          "client_id": {
+            "$type": "string"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "conversations",
+    "category": "core",
+    "validator": {
+      "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+          "customer_id",
+          "onboarding_id",
+          "title",
+          "status"
+        ],
+        "properties": {
+          "_id": {
+            "bsonType": "objectId"
+          },
+          "created_at": {
+            "bsonType": "date"
+          },
+          "updated_at": {
+            "bsonType": "date"
+          },
+          "customer_id": {
+            "bsonType": "objectId"
+          },
+          "onboarding_id": {
+            "bsonType": "objectId"
+          },
+          "title": {
+            "bsonType": "string"
+          },
+          "client_id": {
+            "bsonType": "string"
+          },
+          "status": {
+            "bsonType": "string",
+            "enum": [
+              "active",
+              "archived"
+            ]
+          }
+        }
+      }
+    },
+    "indexes": [
+      {
+        "keys": {
+          "customer_id": 1,
+          "updated_at": -1
+        }
+      },
+      {
+        "keys": {
+          "onboarding_id": 1
+        }
+      },
+      {
+        "keys": {
+          "client_id": 1
+        },
+        "unique": true,
+        "partialFilterExpression": {
+          "client_id": {
+            "$type": "string"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "messages",
+    "category": "core",
+    "validator": {
+      "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+          "conversation_id",
+          "role",
+          "content",
+          "created_at"
+        ],
+        "properties": {
+          "_id": {
+            "bsonType": "objectId"
+          },
+          "created_at": {
+            "bsonType": "date"
+          },
+          "updated_at": {
+            "bsonType": "date"
+          },
+          "conversation_id": {
+            "bsonType": "objectId"
+          },
+          "role": {
+            "bsonType": "string",
+            "enum": [
+              "user",
+              "assistant",
+              "system",
+              "tool"
+            ]
+          },
+          "content": {
+            "bsonType": "string"
+          },
+          "sequence": {
+            "bsonType": "int",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "indexes": [
+      {
+        "keys": {
+          "conversation_id": 1,
+          "created_at": 1,
+          "_id": 1
+        }
+      },
+      {
+        "keys": {
+          "conversation_id": 1,
+          "sequence": 1
+        },
+        "unique": true,
+        "partialFilterExpression": {
+          "sequence": {
+            "$type": "int"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "documents",
+    "category": "core",
+    "validator": {
+      "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+          "customer_id",
+          "onboarding_id",
+          "filename",
+          "content_type",
+          "processing_status"
+        ],
+        "properties": {
+          "_id": {
+            "bsonType": "objectId"
+          },
+          "created_at": {
+            "bsonType": "date"
+          },
+          "updated_at": {
+            "bsonType": "date"
+          },
+          "customer_id": {
+            "bsonType": "objectId"
+          },
+          "onboarding_id": {
+            "bsonType": "objectId"
+          },
+          "conversation_id": {
+            "bsonType": "objectId"
+          },
+          "filename": {
+            "bsonType": "string"
+          },
+          "content_type": {
+            "bsonType": "string"
+          },
+          "storage_id": {
+            "bsonType": "objectId"
+          },
+          "size_bytes": {
+            "bsonType": [
+              "int",
+              "long"
+            ],
+            "minimum": 0
+          },
+          "processing_status": {
+            "bsonType": "string",
+            "enum": [
+              "pending",
+              "processing",
+              "ready",
+              "failed"
+            ]
+          },
+          "source": {
+            "bsonType": "string",
+            "enum": [
+              "uploaded",
+              "generated"
+            ]
+          }
+        }
+      }
+    },
+    "indexes": [
+      {
+        "keys": {
+          "customer_id": 1,
+          "created_at": -1
+        }
+      },
+      {
+        "keys": {
+          "onboarding_id": 1
+        }
+      },
+      {
+        "keys": {
+          "conversation_id": 1
+        }
+      }
+    ]
+  },
+  {
+    "name": "onboarding_requirements",
+    "category": "core",
+    "validator": {
+      "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+          "key",
+          "version",
+          "product",
+          "jurisdiction",
+          "active"
+        ],
+        "properties": {
+          "_id": {
+            "bsonType": "objectId"
+          },
+          "created_at": {
+            "bsonType": "date"
+          },
+          "updated_at": {
+            "bsonType": "date"
+          },
+          "key": {
+            "bsonType": "string"
+          },
+          "version": {
+            "bsonType": "int",
+            "minimum": 1
+          },
+          "product": {
+            "bsonType": "string"
+          },
+          "jurisdiction": {
+            "bsonType": "string"
+          },
+          "active": {
+            "bsonType": "bool"
+          },
+          "required_fields": {
+            "bsonType": "array",
+            "items": {
+              "bsonType": "string"
+            }
+          },
+          "required_documents": {
+            "bsonType": "array",
+            "items": {
+              "bsonType": "object",
+              "required": [
+                "type",
+                "label"
+              ],
+              "properties": {
+                "type": {
+                  "bsonType": "string"
+                },
+                "label": {
+                  "bsonType": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "indexes": [
+      {
+        "keys": {
+          "key": 1,
+          "version": 1
+        },
+        "unique": true
+      },
+      {
+        "keys": {
+          "key": 1
+        },
+        "unique": true,
+        "partialFilterExpression": {
+          "active": true
+        }
+      }
+    ]
+  },
+  {
+    "name": "document_chunks",
+    "category": "agent",
+    "indexes": []
+  },
+  {
+    "name": "procedures",
+    "category": "agent",
+    "indexes": []
+  },
+  {
+    "name": "regulations",
+    "category": "agent",
+    "indexes": []
+  },
+  {
+    "name": "guardrails",
+    "category": "agent",
+    "indexes": []
+  },
+  {
+    "name": "audit_log",
+    "category": "agent",
+    "indexes": []
+  }
+]
