@@ -52,3 +52,28 @@ message UUID, the observed conversation revision, the question sequence, and
 message content. Resending a recent message with the same UUID is safe.
 The chat endpoint uses MongoDB transactions to save an accepted answer and the
 associated chat turn together. Use Atlas or a MongoDB replica set.
+
+## Model-independent sandbox walkthrough
+
+Restart FastAPI and Vite, open the demo login, and choose the customer persona.
+Submit the application form or finish the chat intake and select **Review
+application**. The submitted application provides an ID and a document checklist.
+
+Switch to the bank persona and open the application. Continue from Apply,
+record your sandbox verification, enter a bank risk assessment, and record the
+compliance review. At Risk Review you can request missing information from the
+customer, pause, or continue after documenting the decision. The bank prepares
+a sandbox agreement and approves its release at Document Review. Switch to the
+customer to download and sign it, then return to the bank to provision the
+sandbox account. The customer can then open the account summary.
+
+The bank detail page shows audit history, the last workflow revision, and sandbox
+action evidence. A failed or interrupted sandbox write can be retried at the same
+stage and reconciled against its operation ID. Risk overrides can support a
+reviewer-authored guardrail proposal in the Guardrails screen. Approval records
+a new policy version. Rule text is stored for review and future agent consumption.
+
+The workflow uses Atlas transactions and needs permission to write the application,
+audit, and sandbox collections. It runs synchronously at each customer or bank
+handoff. Bank-entered risk, compliance review, and sandbox records demonstrate
+the handoffs while the model-driven workflow is being built.

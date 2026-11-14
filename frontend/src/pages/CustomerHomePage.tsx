@@ -17,6 +17,7 @@ export default function CustomerHomePage({ onLogout }: { onLogout: () => void })
           <h2 id="start-heading" className="mt-3 text-2xl font-semibold tracking-tight sm:text-3xl">A new beginning for your business</h2>
           <p className="mt-3 text-primary-foreground/85">Apply for business banking with a guided onboarding experience, from your first details to your final signature.</p>
           <Link to="/customer/onboarding" className={buttonVariants({ variant: 'secondary', size: 'lg', className: 'mt-6' })}><Plus aria-hidden="true" />Start onboarding</Link>
+          <Link to="/customer/apply" className="ml-4 text-sm font-medium underline">Apply with a form</Link>
         </div>
       </section>
 

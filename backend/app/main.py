@@ -4,49 +4,33 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from mimetypes import guess_type
 from pathlib import Path
 from typing import AsyncIterator
-from urllib.parse import quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from gridfs import GridFSBucket
 from gridfs.errors import NoFile
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, ReturnDocument
 from pymongo.client_session import ClientSession
-from pymongo.collection import Collection
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import DuplicateKeyError
 
+from .demo import _upsert_by_key, conversation_actor, get_database
+from .documents import document_response, store_upload, stream_document
+from .routers import router
 from .onboarding_agent import QUESTIONS, REVIEW, WELCOME, agent_enabled, interpret_answer
 
 load_dotenv(Path(__file__).resolve().parents[2] / "database" / ".env")
 
 logger = logging.getLogger(__name__)
 
-DEMO_CUSTOMER_NAME = "Northstar Test Goods Ltd."
-DEMO_USER_EMAIL = "customer.demo@customer360.example"
 QUESTION_COUNT = len(QUESTIONS)
-MAX_DOCUMENT_SIZE = 10 * 1024 * 1024
-MAX_DOCUMENTS_PER_CONVERSATION = 10
-ALLOWED_DOCUMENT_EXTENSIONS = {
-    ".pdf",
-    ".docx",
-    ".txt",
-    ".csv",
-    ".png",
-    ".jpg",
-    ".jpeg",
-}
-
-
 class ConversationPayload(BaseModel):
     id: UUID
     startedAt: datetime
@@ -81,6 +65,7 @@ class ConversationResponse(BaseModel):
     turns: list[ChatTurn]
     revision: int
     agentEnabled: bool
+    applicationId: str | None = None
 
 
 class DocumentResponse(BaseModel):
@@ -89,6 +74,7 @@ class DocumentResponse(BaseModel):
     contentType: str
     sizeBytes: int
     createdAt: str
+    source: str
 
 
 @asynccontextmanager
@@ -111,73 +97,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Customer 360 API", lifespan=lifespan)
+app.include_router(router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")],
     allow_methods=["DELETE", "GET", "POST"],
     allow_headers=["Content-Type"],
+    expose_headers=["X-Request-ID"],
 )
 
 
-def get_database(request: Request) -> Database:
-    database = getattr(request.app.state, "database", None)
-    if database is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Atlas is not configured. Set MONGODB_URI and MONGODB_DATABASE.",
-        )
-    return database
-
-
-def _upsert_by_key(
-    collection: Collection, key: dict, insert_fields: dict
-) -> dict:
-    try:
-        return collection.find_one_and_update(
-            key,
-            {"$setOnInsert": insert_fields},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-    except DuplicateKeyError:
-        existing = collection.find_one(key)
-        if existing is None:
-            raise
-        return existing
-
-
-def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
-    now = datetime.now(timezone.utc)
-    customer = _upsert_by_key(
-        database["customers"],
-        {"legal_name": DEMO_CUSTOMER_NAME},
-        {
-            "created_at": now,
-            "updated_at": now,
-            "legal_name": DEMO_CUSTOMER_NAME,
-            "industry": "Retail",
-            "contact": {"email": "onboarding.demo@customer360.example"},
-            "owners": [],
-        },
-    )
-    user = _upsert_by_key(
-        database["users"],
-        {"email": DEMO_USER_EMAIL},
-        {
-            "created_at": now,
-            "updated_at": now,
-            "name": "Customer 360 Demo User",
-            "email": DEMO_USER_EMAIL,
-            "role": "customer",
-            "customer_id": customer["_id"],
-        },
-    )
-    if user.get("customer_id") != customer["_id"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The configured demo user is linked to a different customer.",
-        )
-    return customer["_id"], user["_id"]
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = str(uuid4())
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 def _read_answers(
@@ -199,16 +134,7 @@ def _conversation_response(document: dict, answers: list[str]) -> ConversationRe
         turns=document.get("chat_turns", []),
         revision=document.get("chat_revision", 0),
         agentEnabled=agent_enabled(),
-    )
-
-
-def _document_response(document: dict) -> DocumentResponse:
-    return DocumentResponse(
-        id=str(document["_id"]),
-        filename=document["filename"],
-        contentType=document["content_type"],
-        sizeBytes=document["size_bytes"],
-        createdAt=document["created_at"].isoformat(),
+        applicationId=str(document["onboarding_id"]) if document.get("application_submitted") else None,
     )
 
 
@@ -234,6 +160,12 @@ def _save_answer(
     content: str,
     session: ClientSession | None = None,
 ) -> None:
+    onboarding = database.onboardings.find_one(
+        {"_id": conversation["onboarding_id"], "customer_id": customer_id},
+        session=session,
+    )
+    if onboarding is None or onboarding["status"] != "DRAFT":
+        raise HTTPException(409, "This draft has already been submitted.")
     messages = database["messages"]
     query = {"conversation_id": conversation["_id"], "sequence": sequence}
     existing = messages.find_one(query, session=session)
@@ -277,7 +209,7 @@ def _save_answer(
     answers = _read_answers(database, conversation["_id"], session)
     now = datetime.now(timezone.utc)
     database["onboardings"].update_one(
-        {"_id": conversation["onboarding_id"], "customer_id": customer_id},
+        {"_id": conversation["onboarding_id"], "customer_id": customer_id, "status": "DRAFT"},
         {
             "$set": {
                 "application": {"answers": answers},
@@ -309,7 +241,7 @@ async def login() -> bool:
 @app.get("/api/v1/conversations", response_model=list[ConversationResponse])
 def list_conversations(request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
     conversations = database["conversations"].find(
         {"customer_id": customer_id}
     ).sort("updated_at", -1)
@@ -328,7 +260,7 @@ def list_conversations(request: Request):
 )
 def create_conversation(payload: ConversationPayload, request: Request):
     database = get_database(request)
-    customer_id, user_id = ensure_demo_profile(database)
+    customer_id, user_id = conversation_actor(database, request.query_params.get("customer_id"))
     client_id = str(payload.id)
     started_at = payload.startedAt
     if started_at.tzinfo is None:
@@ -375,7 +307,7 @@ def save_conversation_answer(
     conversation_id: UUID, payload: AnswerPayload, request: Request
 ):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
     conversation = database["conversations"].find_one(
         {"client_id": str(conversation_id), "customer_id": customer_id}
     )
@@ -401,7 +333,7 @@ def save_conversation_answer(
 @app.post("/api/v1/conversations/{conversation_id}/chat", response_model=ConversationResponse)
 def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
     conversation = _owned_conversation(database, customer_id, conversation_id)
     content = payload.content.strip()
     if not content:
@@ -422,6 +354,8 @@ def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Requ
     answers = _read_answers(database, conversation["_id"])
     if not current_turn(conversation, answers):
         return _conversation_response(conversation, answers)
+    if conversation.get("application_submitted"):
+        raise HTTPException(409, "This draft has already been submitted.")
 
     recent_turns = [
         {"message": turn["content"], "clarification": turn["clarification"]}
@@ -444,6 +378,8 @@ def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Requ
         latest_answers = _read_answers(database, latest["_id"], session)
         if not current_turn(latest, latest_answers):
             return _conversation_response(latest, latest_answers)
+        if latest.get("application_submitted"):
+            raise HTTPException(409, "This draft has already been submitted.")
 
         saved = database.conversations.find_one_and_update(
             {"_id": latest["_id"]},
@@ -480,12 +416,12 @@ def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Requ
 )
 def list_documents(conversation_id: UUID, request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
     conversation = _owned_conversation(database, customer_id, conversation_id)
     documents = database["documents"].find(
         {"customer_id": customer_id, "conversation_id": conversation["_id"]}
     ).sort("created_at", 1)
-    return [_document_response(document) for document in documents]
+    return [document_response(document) for document in documents]
 
 
 @app.post(
@@ -499,74 +435,15 @@ def upload_document(
     file: UploadFile = File(...),
 ):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
     conversation = _owned_conversation(database, customer_id, conversation_id)
-    count = database["documents"].count_documents(
-        {"customer_id": customer_id, "conversation_id": conversation["_id"]}
-    )
-    if count >= MAX_DOCUMENTS_PER_CONVERSATION:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A conversation can have at most 10 documents.",
-        )
-
-    filename = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
-    extension = Path(filename).suffix.lower()
-    if not filename or len(filename) > 255 or extension not in ALLOWED_DOCUMENT_EXTENSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail="Choose a PDF, DOCX, TXT, CSV, PNG or JPG file.",
-        )
-    content = file.file.read(MAX_DOCUMENT_SIZE + 1)
-    if not content:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The selected document is empty.",
-        )
-    if len(content) > MAX_DOCUMENT_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Documents must be 10 MB or smaller.",
-        )
-
-    now = datetime.now(timezone.utc)
-    content_type = guess_type(filename)[0] or "application/octet-stream"
-    bucket = GridFSBucket(database)
-    storage_id = bucket.upload_from_stream(
-        filename,
-        content,
-        metadata={
-            "customer_id": customer_id,
-            "onboarding_id": conversation["onboarding_id"],
-            "conversation_id": conversation["_id"],
-        },
-    )
-    document = {
-        "created_at": now,
-        "updated_at": now,
-        "customer_id": customer_id,
-        "onboarding_id": conversation["onboarding_id"],
-        "conversation_id": conversation["_id"],
-        "filename": filename,
-        "content_type": content_type,
-        "storage_id": storage_id,
-        "size_bytes": len(content),
-        "processing_status": "ready",
-        "source": "uploaded",
-    }
-    try:
-        result = database["documents"].insert_one(document)
-    except PyMongoError:
-        bucket.delete(storage_id)
-        raise
-    document["_id"] = result.inserted_id
-    return _document_response(document)
+    return store_upload(database, customer_id, conversation["onboarding_id"], file, conversation["_id"])
 
 
 @app.get("/api/v1/documents/{document_id}/download")
 def download_document(document_id: str, request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
     try:
         object_id = ObjectId(document_id)
     except InvalidId:
@@ -582,34 +459,12 @@ def download_document(document_id: str, request: Request):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found.",
         )
-    try:
-        stream = GridFSBucket(database).open_download_stream(document["storage_id"])
-    except NoFile:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document content not found.",
-        ) from None
-
-    def content_chunks():
-        try:
-            while chunk := stream.read(64 * 1024):
-                yield chunk
-        finally:
-            stream.close()
-
-    return StreamingResponse(
-        content_chunks(),
-        media_type=document["content_type"],
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(document['filename'])}"
-        },
-    )
-
+    return stream_document(database, document)
 
 @app.delete("/api/v1/conversations/{conversation_id}/documents/{document_id}")
 def delete_document(conversation_id: UUID, document_id: str, request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
     conversation = _owned_conversation(database, customer_id, conversation_id)
     try:
         object_id = ObjectId(document_id)

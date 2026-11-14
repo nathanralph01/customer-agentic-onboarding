@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import { ArrowLeft, Bot, Check, Download, History, MessageSquare, Plus, Send, FileText, Upload, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import CustomerLayout from '@/components/CustomerLayout'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import {
   createConversation,
   downloadDocument,
@@ -104,7 +104,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
 
   async function send(event?: FormEvent) {
     event?.preventDefault()
-    if (!active || !draft.trim() || complete || saving) return
+    if (!active || !draft.trim() || active.applicationId || complete || saving) return
     const content = draft.trim()
     const pending = pendingMessage.current
     const message = pending?.conversationId === active.id && pending.message.content === content
@@ -276,7 +276,7 @@ export default function OnboardingPage({ onLogout }: { onLogout: () => void }) {
             {complete && <div className="rounded-xl border bg-muted/40 p-5"><h3 className="flex items-center gap-2 font-semibold"><Check className="size-4 text-primary" aria-hidden="true" />Your business details</h3><dl className="mt-4 space-y-3">{active.answers.map((answer, index) => <div key={active.fields[index]}><dt className="text-xs font-medium text-muted-foreground">{active.fields[index]}</dt><dd className="mt-1 text-sm whitespace-pre-wrap break-words">{answer}</dd></div>)}</dl></div>}
           </div>
           <div className="shrink-0 border-t bg-muted/20 px-5 py-3">
-            {complete ? <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-muted-foreground">Your draft conversation is ready to review.</p><Button variant="outline" onClick={() => setTab('info')}>Add company documents</Button></div> : <form onSubmit={send} className="flex items-end gap-3 rounded-xl border bg-card p-2 focus-within:ring-2 focus-within:ring-ring">
+            {active.applicationId ? <Link className={buttonVariants()} to={`/customer/cases/${active.applicationId}`}>Track submitted application</Link> : complete ? <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-sm text-muted-foreground">Your draft conversation is ready to review.</p><Link className={buttonVariants()} to="/customer/apply" state={{ answers: active.answers, conversationId: active.id }}>Review application</Link><Button variant="outline" onClick={() => setTab('info')}>Add company documents</Button></div> : <form onSubmit={send} className="flex items-end gap-3 rounded-xl border bg-card p-2 focus-within:ring-2 focus-within:ring-ring">
               <label htmlFor="chat-answer" className="sr-only">{active.fields[active.answers.length]}</label>
               <textarea ref={inputRef} id="chat-answer" rows={1} maxLength={4000} value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={handleKeyDown} placeholder="Type your answer…" readOnly={saving} className="min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm outline-none" />
               <Button type="submit" disabled={!draft.trim() || saving} aria-label="Send answer" className="mb-1"><Send aria-hidden="true" /><span className="hidden sm:inline">{saving ? 'Sending…' : 'Send'}</span></Button>
