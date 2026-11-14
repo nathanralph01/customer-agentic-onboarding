@@ -29,12 +29,14 @@ choose **Log in**, then **Log in as customer**. A successful response from
 The demo session lasts for the browser tab and can be ended with **Log out**.
 This is a UI demo, not real authentication. **Start onboarding** opens
 `/customer/onboarding`, a scripted chatbot that gathers business details, owners
-and banking needs. Company documents and conversation history are available
-in separate tabs. Conversations are saved in browser session storage. Document
-attachments are held in memory for the current page visit, with file selection,
-drag and drop, and removal; they are not uploaded or processed by an agent yet.
-No application is submitted to the backend. Other workspace options remain
-disabled placeholders.
+and banking needs. Customer profiles, onboarding drafts, conversations and
+answers are saved in the configured Atlas database. Existing browser-session
+conversations are migrated on first load. Company documents are uploaded to
+Atlas GridFS, with metadata in the `documents` collection; they can be listed,
+downloaded and removed from the workspace. Files are not read or processed by
+an agent. Uploads accept PDF, DOCX, TXT, CSV, PNG or JPG files up to 10 MB,
+with up to 10 files per conversation. No application is submitted for
+verification. Other workspace options remain disabled placeholders.
 
 In development, Vite proxies `/api` to `http://127.0.0.1:8000`. For a separately
 hosted API, set `VITE_API_URL` to the full base URL (including `/api/v1`) before
