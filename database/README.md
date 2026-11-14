@@ -13,7 +13,10 @@ database/.venv/bin/pip install -r database/requirements.txt
 
 Create `database/.env` with `MONGODB_URI` and `MONGODB_DATABASE` if it does not
 already exist. The file is ignored by Git. The initializer and backend load
-these settings automatically; the initializer can also use variables already
+the same env file, but the backend now uses Managed MCP credentials instead of
+`MONGODB_URI`. The URI is needed only by this legacy provisioning utility, which
+creates validators and unique indexes not exposed by the MCP tools. It is not
+run during API startup. The initializer can also use variables already
 set in the process environment.
 
 Initialize from the repository root:
@@ -61,4 +64,6 @@ The onboarding API uses Atlas for customer and user profiles, onboarding
 snapshots, conversations, messages and document metadata. File binaries are
 stored in the default GridFS bucket (`fs.files` and `fs.chunks`), created
 automatically on first upload. The Atlas user must have read/write permissions
-and permission to create GridFS collections and indexes.
+and permission to create GridFS collections and indexes when using this legacy
+initializer. At runtime, the API accesses these collections exclusively through
+Atlas Managed MCP. See `backend/README.md` for the current application settings.
