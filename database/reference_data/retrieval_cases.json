@@ -1,0 +1,66 @@
+[
+  {
+    "id": "ownership-threshold",
+    "query": "What beneficial ownership threshold applies when verifying a corporation, and does it include indirect control?",
+    "expected_source_ids": [
+      "c360:ca-pcmltfr-138-1-3:v1"
+    ],
+    "expected_answer": "At least 25% of shares by direct or indirect ownership or control. Include directors and ownership structure where relevant."
+  },
+  {
+    "id": "unconfirmed-ownership",
+    "query": "Which rule applies if the required beneficial ownership information cannot be confirmed?",
+    "expected_source_ids": [
+      "c360:ca-pcmltfr-138-4:v1",
+      "c360:ca-pcmltfr-157:v1"
+    ],
+    "expected_answer": "Reasonable measures to verify the CEO or equivalent, plus the relevant section 157 special measures."
+  },
+  {
+    "id": "verify-timing",
+    "query": "When is corporate identity verification required for an ordinary account under paragraph 86(b)?",
+    "expected_source_ids": [
+      "c360:ca-pcmltfr-109:v1"
+    ],
+    "expected_answer": "Before the first transaction beyond the initial deposit. Scope the answer to paragraph 86(b)."
+  },
+  {
+    "id": "privacy-minimization",
+    "query": "Should onboarding chat collect extra personal identifiers just in case?",
+    "expected_source_ids": [
+      "c360:ca-pipeda-s1-collection:v1",
+      "c360:demo-data-handling:v1"
+    ],
+    "expected_answer": "Collect only information needed for identified purposes. The demo policy directs sensitive evidence away from chat and traces."
+  },
+  {
+    "id": "osfi-scope",
+    "query": "Does using a third-party verification service transfer accountability away from the bank?",
+    "expected_source_ids": [
+      "c360:ca-osfi-b10:v1"
+    ],
+    "expected_answer": "The institution retains accountability for outsourced activities under OSFI supervisory guidance."
+  },
+  {
+    "id": "bank-review",
+    "query": "Under the demo bank policy, what should happen when risk is high or material inputs are missing?",
+    "expected_source_ids": [
+      "c360:demo-risk-routing:v1"
+    ],
+    "expected_answer": "Route material gaps to NEEDS_INFO. Require an explicit bank decision with a reason for high risk. Identify the rule as demo policy."
+  },
+  {
+    "id": "document-release",
+    "query": "Can the demo agreement be released as soon as it has been generated?",
+    "expected_source_ids": [
+      "c360:demo-review-release:v1"
+    ],
+    "expected_answer": "Hold it until a bank reviewer approves release after document review."
+  },
+  {
+    "id": "source-scope",
+    "query": "Does this collection establish Ontario-specific licensing requirements for every sector?",
+    "expected_source_ids": [],
+    "expected_answer": "Explain that the corpus covers selected Canadian federal material and demo policy. Ask for the sector and seek the appropriate provincial source."
+  }
+]

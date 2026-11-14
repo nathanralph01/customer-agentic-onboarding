@@ -25,6 +25,11 @@ async def _upsert_by_key(collection: Collection, key: dict, insert_fields: dict)
 
 
 async def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
+    user_key = {"email": DEMO_USER_EMAIL}
+    user = await database.users.find_one(user_key)
+    if user is not None:
+        return await _linked_demo_customer(database, user)
+
     now = datetime.now(timezone.utc)
     customer = await _upsert_by_key(
         database["customers"],
@@ -40,7 +45,7 @@ async def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
     )
     user = await _upsert_by_key(
         database["users"],
-        {"email": DEMO_USER_EMAIL},
+        user_key,
         {
             "created_at": now,
             "updated_at": now,
@@ -50,12 +55,21 @@ async def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
             "customer_id": customer["_id"],
         },
     )
-    if user.get("customer_id") != customer["_id"]:
+    return await _linked_demo_customer(database, user)
+
+
+async def _linked_demo_customer(database: Database, user: dict) -> tuple[ObjectId, ObjectId]:
+    customer_id = user.get("customer_id")
+    if (
+        user.get("role") != "customer"
+        or not isinstance(customer_id, ObjectId)
+        or await database.customers.find_one({"_id": customer_id}) is None
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The configured demo user is linked to a different customer.",
+            detail="The demo user does not have a valid customer profile.",
         )
-    return customer["_id"], user["_id"]
+    return customer_id, user["_id"]
 
 
 def object_id(value: str) -> ObjectId:

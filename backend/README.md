@@ -137,6 +137,17 @@ integration package for your chosen provider. Set `ONBOARDING_CHAT_MODEL` to
 `provider:model` and configure that provider's credentials before starting
 Uvicorn. Choose a chat model that supports LangChain structured output.
 
+FastAPI loads the Git-ignored `backend/.env` for model settings and then loads
+`database/.env` for Atlas settings. Process environment variables take
+precedence. For the Gemini Developer API, install `langchain-google-genai` and
+set these values in `backend/.env`:
+
+```dotenv
+GOOGLE_API_KEY=your_gemini_api_key
+GOOGLE_GENAI_USE_VERTEXAI=false
+ONBOARDING_CHAT_MODEL=google_genai:gemini-3.1-flash-lite
+```
+
 The backend sends synthetic chat messages and recent clarifications to the
 configured provider through LangChain. The intake instructions live in
 `app/skills/onboarding-intake/SKILL.md`. A provider error keeps the current

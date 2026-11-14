@@ -1,5 +1,6 @@
 """Customer 360 demo API with Atlas-backed onboarding conversations."""
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -25,6 +26,7 @@ from .documents import document_response, store_upload, stream_document
 from .routers import router
 from .onboarding_agent import QUESTIONS, REVIEW, WELCOME, agent_enabled, interpret_answer
 
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 load_dotenv(Path(__file__).resolve().parents[2] / "database" / ".env")
 
 logger = logging.getLogger(__name__)
@@ -117,7 +119,14 @@ async def storage_error_handler(request: Request, error: StorageError):
 @app.middleware("http")
 async def storage_request(request: Request, call_next):
     database = getattr(request.app.state, "database", None)
-    if database is None or request.url.path == "/api/v1/login":
+    path = request.url.path
+    # Persona initialization and pending chat recovery can write during a GET.
+    writes = (request.method in {"POST", "DELETE"} and path != "/api/v1/login") or path in {
+        "/api/v1/demo/users", "/api/v1/conversations",
+    }
+    # Legacy document requests can initialize the default customer.
+    legacy_documents = path.startswith(("/api/v1/conversations/", "/api/v1/documents/")) and not request.query_params.get("customer_id")
+    if database is None or not (writes or legacy_documents):
         response = await call_next(request)
     else:
         async with database.write_lock:
@@ -169,7 +178,7 @@ async def _save_answer(
     customer_id: ObjectId,
     sequence: int,
     content: str,
-) -> None:
+) -> list[str]:
     onboarding = await database.onboardings.find_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id},
     )
@@ -177,22 +186,13 @@ async def _save_answer(
         raise HTTPException(409, "This draft has already been submitted.")
     messages = database["messages"]
     query = {"conversation_id": conversation["_id"], "sequence": sequence}
-    existing = await messages.find_one(query)
-    if existing is not None:
-        if existing["content"] != content:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This answer sequence was already saved with different content.",
-            )
+    answers = await _read_answers(database, conversation["_id"])
+    if sequence < len(answers):
+        if answers[sequence] != content:
+            raise HTTPException(409, "This answer sequence was already saved with different content.")
     else:
-        current_count = await messages.count_documents(
-            {"conversation_id": conversation["_id"], "role": "user"}
-        )
-        if sequence != current_count:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Answers must be submitted in order.",
-            )
+        if sequence != len(answers):
+            raise HTTPException(409, "Answers must be submitted in order.")
         now = datetime.now(timezone.utc)
         try:
             await messages.insert_one(
@@ -212,7 +212,8 @@ async def _save_answer(
                     detail="This answer sequence was already saved with different content.",
                 ) from None
 
-    answers = await _read_answers(database, conversation["_id"])
+        answers.append(content)
+
     now = datetime.now(timezone.utc)
     await database["onboardings"].update_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id, "status": "DRAFT"},
@@ -235,6 +236,8 @@ async def _save_answer(
         },
     )
 
+    return answers
+
 
 @app.post("/api/v1/login", response_model=bool)
 async def login() -> bool:
@@ -249,9 +252,43 @@ async def list_conversations(request: Request):
     conversations = await database["conversations"].find(
         {"customer_id": customer_id}, sort=("updated_at", -1)
     )
+    if not conversations:
+        return []
+
+    onboarding_ids = [
+        row["onboarding_id"] for row in conversations if not row.get("application_submitted")
+    ]
+    async def submitted_ids():
+        if not onboarding_ids:
+            return set()
+        rows = await database.onboardings.find(
+            {"_id": {"$in": onboarding_ids}, "status": {"$ne": "DRAFT"}},
+            projection={"_id": 1},
+        )
+        return {row["_id"] for row in rows}
+
+    submitted, messages = await asyncio.gather(
+        submitted_ids(),
+        database.messages.find(
+            {"conversation_id": {"$in": [row["_id"] for row in conversations]}, "role": "user"},
+            sort=("sequence", 1),
+            projection={"conversation_id": 1, "sequence": 1, "content": 1},
+        ),
+    )
+    answers = {}
+    for message in messages:
+        answers.setdefault(message["conversation_id"], []).append(message["content"])
+
+    responses = {}
+    for row in conversations:
+        if row["onboarding_id"] in submitted:
+            row["application_submitted"] = True
+        if row.get("pending_answer") and not row.get("application_submitted"):
+            responses[row["_id"]] = await _chat_response(database, row, customer_id)
     return [
-        await _chat_response(database, conversation, customer_id)
-        for conversation in conversations
+        responses[row["_id"]] if row["_id"] in responses
+        else _conversation_response(row, answers.get(row["_id"], []))
+        for row in conversations
     ]
 
 
@@ -324,12 +361,8 @@ async def save_conversation_answer(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Answer cannot be blank.",
         )
-    await _save_answer(
-        database, conversation, customer_id, payload.sequence, content
-    )
-    return _conversation_response(
-        conversation, await _read_answers(database, conversation["_id"])
-    )
+    answers = await _save_answer(database, conversation, customer_id, payload.sequence, content)
+    return _conversation_response(conversation, answers)
 
 
 async def _chat_response(database, conversation, customer_id):
@@ -338,10 +371,11 @@ async def _chat_response(database, conversation, customer_id):
         if onboarding and onboarding["status"] != "DRAFT":
             conversation = {**conversation, "application_submitted": True}
         elif turn := conversation.get("pending_answer"):
-            await _save_answer(database, conversation, customer_id, turn["sequence"], turn["answer"])
+            answers = await _save_answer(database, conversation, customer_id, turn["sequence"], turn["answer"])
             await database.conversations.update_one(
                 {"_id": conversation["_id"]}, {"$unset": {"pending_answer": ""}},
             )
+            return _conversation_response(conversation, answers)
     answers = await _read_answers(database, conversation["_id"])
     return _conversation_response(conversation, answers)
 
