@@ -124,3 +124,51 @@ directly, following MongoDB's recommendation for programmatic agents.
 
 References: [MongoDB setup](https://www.mongodb.com/docs/mcp-server/get-started/),
 [managed MCP overview](https://www.mongodb.com/docs/mcp-server/overview/).
+
+## Onboarding chatbot MVP
+
+Open the customer demo and select business onboarding. FastAPI supplies the
+questions, tracks progress, and saves chat turns and accepted answers in Atlas.
+The existing conversation history can resume previously saved drafts.
+
+The chatbot starts in guided mode with MongoDB alone. To enable model-assisted
+follow-ups, install the updated backend requirements and the LangChain
+integration package for your chosen provider. Set `ONBOARDING_CHAT_MODEL` to
+`provider:model` and configure that provider's credentials before starting
+Uvicorn. Choose a chat model that supports LangChain structured output.
+
+The backend sends synthetic chat messages and recent clarifications to the
+configured provider through LangChain. The intake instructions live in
+`app/skills/onboarding-intake/SKILL.md`. A provider error keeps the current
+question open so the message can be retried.
+
+The frontend calls `POST /api/v1/conversations/{conversation_id}/chat` with a
+message UUID, the observed conversation revision, the question sequence, and
+message content. Resending a recent message with the same UUID is safe.
+The chat endpoint persists an accepted decision before saving the answer.
+A retry or conversation reload completes an interrupted answer write.
+
+## Model-independent sandbox walkthrough
+
+Restart FastAPI and Vite, open the demo login, and choose the customer persona.
+Submit the application form or finish the chat intake and select **Review
+application**. The submitted application provides an ID and a document checklist.
+
+Switch to the bank persona and open the application. Continue from Apply,
+record your sandbox verification, enter a bank risk assessment, and record the
+compliance review. At Risk Review you can request missing information from the
+customer, pause, or continue after documenting the decision. The bank prepares
+a sandbox agreement and approves its release at Document Review. Switch to the
+customer to download and sign it, then return to the bank to provision the
+sandbox account. The customer can then open the account summary.
+
+The bank detail page shows audit history, the last workflow revision, and sandbox
+action evidence. A failed or interrupted sandbox write can be retried at the same
+stage and reconciled against its operation ID. Risk overrides can support a
+reviewer-authored guardrail proposal in the Guardrails screen. Approval records
+a new policy version. Rule text is stored for review and future agent consumption.
+
+The workflow uses Atlas Managed MCP and needs permission to write the
+application, guardrail, and sandbox collections. Each application update stores
+its audit entry with the state change. It runs at each customer or bank handoff. Bank-entered risk, compliance review, and sandbox records demonstrate
+the handoffs while the model-driven workflow is being built.

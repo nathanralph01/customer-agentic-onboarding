@@ -35,6 +35,20 @@ class MCPDatabaseTests(unittest.IsolatedAsyncioTestCase):
         second = session.call_tool.call_args_list[1].args[1]
         self.assertEqual(decode(second["filter"]), {"$and": [{"role": "user"}, {"_id": {"$gt": ids[0]}}]})
 
+    async def test_update_keeps_revision_precondition(self):
+        record_id = ObjectId()
+        session = AsyncMock()
+        session.call_tool.side_effect = [
+            result({"documents": [{"_id": record_id, "revision": 3}]}),
+            result({"matchedCount": 1}),
+        ]
+        db = MCPDatabase(session, "connection", "test")
+        query = {"_id": record_id, "revision": 3}
+        await db.onboardings.update_one(query, {"$inc": {"revision": 1}})
+        name, arguments = session.call_tool.call_args.args
+        self.assertEqual(name, "update-many")
+        self.assertEqual(decode(arguments["filter"]), query)
+
     async def test_oversized_result_fails_instead_of_silently_losing_records(self):
         session = AsyncMock()
         session.call_tool.return_value = result({"documents": [], "queryResultsCount": 1})

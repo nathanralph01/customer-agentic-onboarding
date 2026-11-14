@@ -1,38 +1,29 @@
-import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { ArrowRight, Building2 } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import { ArrowRight, Building2, ShieldCheck } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
-import { login } from '@/lib/api'
+import { listPersonas, type Persona } from '@/lib/api'
 
-export default function LoginPage({ onLogin }: { onLogin: () => void }) {
-  const navigate = useNavigate()
-  const [pending, setPending] = useState(false)
-  const [error, setError] = useState('')
+export default function LoginPage({ onLogin }: { onLogin: (persona: Persona) => void }) {
+  const { data, isPending, error, refetch } = useQuery({ queryKey: ['personas'], queryFn: listPersonas })
 
-  async function handleLogin() {
-    setPending(true)
-    setError('')
-    try {
-      await login()
-      onLogin()
-      navigate('/customer', { replace: true })
-    } catch (error) {
-      setError(error instanceof Error ? error.message : 'Unable to log in. Please try again.')
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return <main className="flex min-h-screen items-center justify-center px-4 py-12">
-    <div className="w-full max-w-md rounded-2xl border bg-card p-8 shadow-sm">
-      <Link to="/" className="font-semibold text-primary underline-offset-4 hover:underline">Customer 360</Link>
-      <span className="mt-8 flex size-12 items-center justify-center rounded-xl bg-accent text-primary"><Building2 aria-hidden="true" /></span>
-      <h1 className="mt-5 text-3xl font-bold tracking-tight">Welcome back</h1>
-      <p className="mt-3 text-muted-foreground">Enter your customer workspace to manage your business banking onboarding.</p>
-      <div className="my-6 rounded-lg border bg-muted/50 p-4 text-sm"><p className="font-medium">Customer demo</p><p className="mt-1 text-muted-foreground">No password needed. Login is mocked for this demo.</p></div>
-      {error && <p role="alert" className="mb-4 text-sm text-destructive">{error}</p>}
-      <Button className="w-full" size="lg" disabled={pending} onClick={handleLogin}>{pending ? 'Logging in…' : 'Log in as customer'}<ArrowRight aria-hidden="true" /></Button>
-      <Link to="/" className="mt-5 block text-center text-sm text-muted-foreground underline-offset-4 hover:underline">Back to website</Link>
+  return <main className="flex min-h-screen items-center justify-center bg-muted/40 px-4 py-12">
+    <div className="w-full max-w-lg rounded-2xl border bg-card p-8 shadow-sm">
+      <Link to="/" className="font-semibold text-primary hover:underline">Customer 360</Link>
+      <h1 className="mt-7 text-3xl font-bold tracking-tight">Choose a demo persona</h1>
+      <p className="mt-2 text-sm text-muted-foreground">Use synthetic data in the customer and bank workspaces.</p>
+      <div className="mt-6 grid gap-3">
+        {isPending && <p role="status">Loading personas…</p>}
+        {error && <><p role="alert" className="text-destructive">{error.message}</p><Button variant="outline" onClick={() => refetch()}>Try again</Button></>}
+        {data?.map(persona => {
+          const Icon = persona.role === 'customer' ? Building2 : ShieldCheck
+          return <button key={persona.id} type="button" onClick={() => onLogin(persona)} className="flex items-center gap-4 rounded-xl border p-4 text-left hover:border-primary hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">
+            <Icon className="size-6 text-primary" aria-hidden="true" />
+            <span className="flex-1"><strong className="block">{persona.name}</strong><span className="text-sm text-muted-foreground">{persona.role === 'admin' ? 'Bank reviewer' : 'Business customer'}</span></span>
+            <ArrowRight className="size-4" aria-hidden="true" />
+          </button>
+        })}
+      </div>
     </div>
   </main>
 }
