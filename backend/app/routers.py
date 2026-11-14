@@ -1,6 +1,8 @@
 """Customer and bank employee APIs for the sandbox onboarding workflow."""
 
+import asyncio
 import logging
+import os
 from hashlib import sha256
 from datetime import date, datetime, time, timezone
 from typing import Annotated, Literal
@@ -13,8 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from starlette.concurrency import run_in_threadpool
 
 from .mcp_database import MCPBucket, MCPDatabase as Database
-from .workflow_agents import AgreementDraft, EvidenceCheck, RiskRecommendation, cited_sources, run_skill
+from .reference_search import REFERENCE_FIELDS, SCOPE, retrieve_references
+from .workflow_agents import AgreementDraft, FinalAssessment, cited_sources, run_skill
 
+from .agreement_terms import pricing_schedule, render_schedule
 from .demo import customer_scope, _upsert_by_key, conversation_actor, ensure_demo_profile, get_actor, get_database, object_id
 from .documents import document_response, store_upload, stream_document
 from .workflow import GATES, REQUIRED_DOCUMENTS, RISK_POLICY, STEPS, TERMINAL, SIGNED_WORKFLOW, SIGNED_STATES, case_status, now, progress, transition, uses_signed_workflow, workflow_steps
@@ -135,10 +139,16 @@ async def start_application(payload: Application, database: Db, actor: Customer)
     application = payload.model_dump(exclude={"id", "conversationId"})
     lookup = {"client_id": client_id, **customer_scope(customer_id)}
     record = await database.onboardings.find_one(lookup)
+    if record and record.get("discarding"):
+        raise HTTPException(409, "This draft is being discarded.")
     if payload.conversationId and record is None:
         raise HTTPException(404, "Conversation draft not found.")
 
     if record is None or record["status"] == "DRAFT":
+        try:
+            pricing_schedule(payload.products)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
         fields = {
             "status": "APPLIED", "workflow": SIGNED_WORKFLOW, "stage": 0, "revision": 0, "application": application,
             "required_documents": list(REQUIRED_DOCUMENTS),
@@ -186,7 +196,7 @@ async def case_documents(database, record, admin=False):
             "id": str(packet["_id"]), "filename": "Sandbox banking agreement.txt",
             "contentType": "text/plain", "sizeBytes": len(packet["content"].encode()),
             "createdAt": packet["created_at"].isoformat(), "source": "generated",
-            "coverNote": packet.get("cover_note"),
+            "coverNote": packet.get("cover_note"), "pricing": packet.get("pricing"),
         })
     return documents
 
@@ -611,45 +621,75 @@ async def prepare_agreement(database, record):
             raise HTTPException(409, "An incompatible agreement already exists for this application.")
         return
     application = {key: record["application"][key] for key in ("businessName", "registration", "products")}
+    try:
+        pricing = pricing_schedule(application["products"])
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
     draft, _ = await agent_result("document-generation", AgreementDraft, {"application": application})
     if draft.missingFields:
         raise HTTPException(422, "Agreement fields need review: " + ", ".join(draft.missingFields))
     content = (
         "Customer 360 sandbox business banking agreement\n"
-        "Template version: 1\n"
+        "Template version: 2\n"
         f"Application: {record['_id']}\n\n"
         f"Legal business name: {application['businessName']}\n"
         f"Registration: {application['registration']}\n"
         f"Requested products: {application['products']}\n\n"
-        "Demo agreement for a sandbox banking account. No real account, pricing or legal obligation is created.\n"
+        f"{render_schedule(pricing)}\n\n"
+        "Billing and acceptance\n"
+        "All amounts are Canadian dollars. Deposit and payment fees apply from service activation.\n"
+        "Review this schedule before accepting. Activation follows final bank approval.\n\n"
+        "These fictional rates and terms apply only to this sandbox. Signing creates no real banking or legal obligation.\n"
         "Use the onboarding workspace to record and return a sandbox signature.\n"
     )
     await sandbox_effect(database, record, "prepare-agreement", "sandbox_documents", {
-        "content": content, "template_version": 1, "digest": sha256(content.encode()).hexdigest(),
+        "content": content, "template_version": 2, "digest": sha256(content.encode()).hexdigest(),
+        "pricing": pricing,
         "cover_note": draft.coverNote,
     })
 
 
+async def review_references(database, record):
+    vector_enabled = bool(os.getenv("VOYAGE_API_KEY"))
+    if vector_enabled:
+        application = record["application"]
+        # Search with product and case topics; keep names and uploaded evidence out of Voyage inputs.
+        query = (
+            "Canadian corporate business banking onboarding: identity and registration verification, "
+            "beneficial ownership evidence, privacy, signed agreement and risk scoring. "
+            f"Sector: {application['sector'][:120]}. Products: {application['products'][:120]}."
+        )
+        try:
+            return await retrieve_references(database, query), "atlas_vector_search"
+        except Exception as error:
+            logger.warning("Reference vector search failed (%s)", type(error).__name__)
+            raise HTTPException(503, "Reference vector search failed. Check the Voyage key and Atlas indexes.") from None
+    regulations, procedures = await asyncio.gather(
+        database.regulations.find(SCOPE, projection=dict.fromkeys(REFERENCE_FIELDS, 1)),
+        database.procedures.find(SCOPE, projection=dict.fromkeys(REFERENCE_FIELDS, 1)),
+    )
+    return [*regulations, *procedures], "reference_corpus"
+
+
 async def final_reports(database, record, actor):
     signature = await checked_signature(database, record)
-    filter_by = {"dataset": "customer360-onboarding-reference", "jurisdiction": "CA", "version": 1}
-    references = [
-        *await database.regulations.find(filter_by),
-        *await database.procedures.find(filter_by),
-    ]
+    (references, retrieval), documents, policy = await asyncio.gather(
+        review_references(database, record),
+        database.documents.find({"onboarding_id": record["_id"], "source": "uploaded"}),
+        risk_policy(database, actor),
+    )
     if not references or {source["kind"] for source in references} <= {"demo_bank_policy"} or not any(
         source["kind"] == "demo_bank_policy" for source in references
     ):
         raise HTTPException(409, "Load the Canadian regulatory references and bank procedures before running verification.")
-    documents = await database.documents.find({"onboarding_id": record["_id"], "source": "uploaded"})
-    evidence = []
-    for document in documents:
+    async def read_evidence(document):
         item = {"id": str(document["_id"]), "filename": document["filename"]}
         if document["content_type"] == "text/plain" and document["size_bytes"] <= 12000:
             content = await MCPBucket(database).read(document["storage_id"])
             item["text"] = content.decode("utf-8", errors="replace")
-        evidence.append(item)
-    policy = await risk_policy(database, actor)
+        return item
+
+    evidence = await asyncio.gather(*(read_evidence(document) for document in documents))
     context = {
         "application": record["application"], "responses": record.get("information_responses", []),
         "signed_agreement": {"digest": signature["digest"], "template_version": signature["template_version"]},
@@ -660,13 +700,20 @@ async def final_reports(database, record, actor):
         ],
         "bank_policy": policy,
     }
-    verification, sources = await agent_result("risk-assessment", EvidenceCheck, {
-        **context, "task": "Verify the evidence against applicable requirements and identify gaps.",
-    }, references)
-    verified = {**verification.model_dump(), "sources": sources, "agreementDigest": signature["digest"]}
-    risk, citations = await agent_result("risk-assessment", RiskRecommendation, {
-        **context, "verification": verified, "task": "Draft the final bank risk recommendation.",
-    }, references)
+    assessment, _ = await agent_result("risk-assessment", FinalAssessment, {
+        **context,
+        "task": "First verify the evidence against the supplied requirements. Then use the verification findings and gaps to draft the final bank risk recommendation.",
+    })
+    verification, risk = assessment.verification, assessment.risk
+    try:
+        sources = cited_sources(verification, references)
+        citations = cited_sources(risk, references)
+    except ValueError:
+        raise HTTPException(503, "The workflow agent returned an unknown reference. Retry the assessment.") from None
+    verified = {
+        **verification.model_dump(), "sources": sources,
+        "agreementDigest": signature["digest"], "retrieval": retrieval,
+    }
     highest = max(risk.ownership, risk.activity, risk.geography)
     return {
         "verification": verified,

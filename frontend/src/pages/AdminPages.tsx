@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ClipboardCheck, ClipboardList, ShieldCheck, Users } from 'lucide-react'
 import { Link, NavLink, useParams } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
-import { CaseList, Documents, Field, RequestStatus } from '@/components/WorkflowUi'
+import { CaseList, ConfirmDialog, Documents, Field, RequestStatus, SuccessNotice } from '@/components/WorkflowUi'
 import { card, caseOpen, dateLabel, input, page, statusLabel } from '@/lib/workflowUi'
 import type { Citation } from '@/lib/api'
 import { adminApi, downloadCaseDocument, getPersona, type CaseDetail, type CaseDocument, type Risk } from '@/lib/api'
@@ -57,10 +57,11 @@ export function AdminCasesPage({ onLogout, queue = false }: Props & { queue?: bo
   </AdminLayout>
 }
 
-function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: () => void }) {
+function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: (message: string) => void }) {
   const waitingCustomer = ['NEEDS_INFO', 'AWAITING_SIGNATURE'].includes(item.status)
   const [decision, setDecision] = useState<ReviewDecision>(waitingCustomer ? '' : 'continue')
   const [comments, setComments] = useState('')
+  const [confirming, setConfirming] = useState(false)
   const editableRisk = !item.signedWorkflow && [2, 4].includes(item.stage) && !['PAUSED', 'NEEDS_INFO'].includes(item.status)
   const [editRisk, setEditRisk] = useState(editableRisk && item.stage === 2 && !item.risk)
   const [tier, setTier] = useState<Risk['tier']>(item.risk?.tier ?? 'low')
@@ -73,17 +74,25 @@ function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: () => void }
     mutationFn: () => adminApi.review(item.id, decision, item.revision, comments, editableRisk && editRisk && decision !== 'cancel' ? {
       tier, rationale, evidence: lines(evidence), missingInputs: lines(missing), ...assessment,
     } : undefined),
-    onSuccess: onSaved,
+    onSuccess: (saved) => onSaved(saved.rejected ? 'Application rejected.' : saved.status === 'ONBOARDED'
+      ? 'Onboarding completed successfully.' : decision === 'request_info' ? 'Information request sent.'
+      : decision === 'pause' ? 'Application paused.' : decision === 'cancel' ? 'Application cancelled.'
+      : decision === 'continue' && item.status === 'PAUSED' ? 'Application resumed.'
+      : `${item.currentStep} completed successfully.`),
   })
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (decision === 'cancel' && !window.confirm(item.signedWorkflow ? 'Reject this application?' : 'Cancel this application?')) return
+    if (review.isPending) return
+    if (decision === 'cancel') {
+      setConfirming(true)
+      return
+    }
     review.mutate()
   }
 
   const signedAction = ['Start agreement preparation', 'Generate agreement', 'Release agreement', '', 'Verify evidence and assess risk', 'Approve and complete onboarding'][item.stage]
   if (!caseOpen(item.status)) return null
-  return <form className={`${card} space-y-4`} onSubmit={submit}>
+  return <><form className={`${card} space-y-4`} onSubmit={submit}>
     <h2 className="text-lg font-semibold">{item.status === 'ADMIN_REVIEW' ? item.currentStep : 'Bank action'}</h2>
     {item.stage === 4 && item.risk?.tier === 'high' && <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">High risk. Record the reason for continuing.</p>}
     {waitingCustomer && <p className="text-sm text-muted-foreground">Waiting for the customer to {item.status === 'NEEDS_INFO' ? 'provide information' : 'sign the agreement'}.</p>}
@@ -108,11 +117,16 @@ function ReviewForm({ item, onSaved }: { item: CaseDetail; onSaved: () => void }
       </fieldset>}
     </>}
     <Field label={decision === 'request_info' ? 'What should the customer provide?' : 'Reviewer comments'}>
-      <textarea className={input} value={comments} onChange={event => setComments(event.target.value)} maxLength={4000} />
+      <textarea className={input} value={comments} onChange={event => setComments(event.target.value)} maxLength={4000} required={decision === 'cancel' && item.signedWorkflow} />
     </Field>
-    <RequestStatus error={review.error} />
+    <RequestStatus pending={review.isPending} label="Saving bank decision…" error={review.error} />
     <Button type="submit" disabled={review.isPending || !decision}>{review.isPending ? 'Working…' : 'Save decision'}</Button>
   </form>
+    {confirming && <ConfirmDialog title={item.signedWorkflow ? 'Reject application?' : 'Cancel application?'}
+      description={comments.trim() || 'This closes the application.'}
+      action={item.signedWorkflow ? 'Reject application' : 'Cancel application'}
+      onClose={() => setConfirming(false)} onConfirm={() => { setConfirming(false); review.mutate() }} />}
+  </>
 }
 
 function CitationList({ sources }: { sources: Citation[] }) {
@@ -124,18 +138,21 @@ function CitationList({ sources }: { sources: Citation[] }) {
 export function AdminCasePage({ onLogout }: Props) {
   const { id = '' } = useParams()
   const queryClient = useQueryClient()
+  const [notice, setNotice] = useState('')
   const query = useQuery({ queryKey: ['admin-case', id], queryFn: () => adminApi.detail(id), refetchInterval: 4000 })
   const download = useMutation({ mutationFn: (document: CaseDocument) => downloadCaseDocument('admin', id, document) })
-  function refresh() {
+  function refresh(message: string) {
+    setNotice(message)
     void queryClient.invalidateQueries({ queryKey: ['admin-case', id] })
     void queryClient.invalidateQueries({ queryKey: ['admin-cases'] })
     void queryClient.invalidateQueries({ queryKey: ['admin-queue'] })
   }
-  const retry = useMutation({ mutationFn: () => adminApi.retry(id), onSuccess: refresh })
+  const retry = useMutation({ mutationFn: () => adminApi.retry(id), onSuccess: () => refresh('Sandbox action completed successfully.') })
   const item = query.data
   const applicationLabels = { businessName: 'Legal business name', businessActivity: 'Business activity', sector: 'Sector', registration: 'Registration', owners: 'Owners', products: 'Requested products' }
 
   return <AdminLayout onLogout={onLogout}>
+    {notice && <SuccessNotice message={notice} dismiss={() => setNotice('')} />}
     <Link to="/admin" className="text-sm text-primary hover:underline">Back to applications</Link>
     <RequestStatus pending={query.isPending} error={query.error} />
     {item && <>
@@ -161,18 +178,19 @@ export function AdminCasePage({ onLogout }: Props) {
         </section>
         {item.verification && <section className={`${card} space-y-3`}>
           <h2 className="text-lg font-semibold">Signed agreement verification</h2>
+          {item.verification.retrieval === 'atlas_vector_search' && <p className="text-xs text-muted-foreground">References retrieved with MongoDB Atlas Vector Search</p>}
           <ul className="list-inside list-disc text-sm">{item.verification.findings.map((finding, index) => <li key={index}>{finding}</li>)}</ul>
           {item.verification.missingInputs.length > 0 && <p className="text-sm">Missing evidence: {item.verification.missingInputs.join('; ')}</p>}
           <CitationList sources={item.verification.sources} />
         </section>}
-        <section className={`${card} space-y-3`}><h2 className="text-lg font-semibold">Documents</h2><RequestStatus error={download.error} /><Documents documents={item.documents} download={document => download.mutate(document)} /></section>
+        <section className={`${card} space-y-3`}><h2 className="text-lg font-semibold">Documents</h2><RequestStatus error={download.error} /><Documents documents={item.documents} downloading={download.isPending ? download.variables?.id : undefined} download={document => download.mutate(document)} /></section>
         <section className={`${card} space-y-3`}>
           <h2 className="text-lg font-semibold">Sandbox actions</h2>
           <p className="text-sm">Last checkpoint: {item.checkpoint.step} · revision {item.checkpoint.revision}</p>
           {item.actions.length ? <ul className="grid gap-2">{item.actions.map(action => <li key={action.id} className="break-words rounded-lg bg-muted p-3 text-sm">
             <p className="font-medium">{statusLabel(action.target)} · {action.state}</p><p className="text-xs">{action.reference}</p><p>{action.evidence}</p>{action.state === 'conflict' && <p className="mt-1 text-destructive">The target record needs operator review.</p>}
           </li>)}</ul> : <p className="text-sm text-muted-foreground">No sandbox actions recorded.</p>}
-          <RequestStatus error={retry.error} />
+          <RequestStatus pending={retry.isPending} label="Retrying sandbox action…" error={retry.error} />
           {!item.signedWorkflow && ['DOCUMENT_GENERATION', 'PROVISIONING', 'VERIFYING'].includes(item.status) && item.actions.some(action => action.state !== 'verified') && <Button variant="outline" disabled={retry.isPending} onClick={() => retry.mutate()}>Retry sandbox action</Button>}
         </section>
         <section className={`${card} space-y-3`}>
@@ -190,6 +208,7 @@ export function AdminCasePage({ onLogout }: Props) {
 
 export function GuardrailsPage({ onLogout }: Props) {
   const client = useQueryClient()
+  const [notice, setNotice] = useState('')
   const [caseId, setCaseId] = useState('')
   const [rule, setRule] = useState('')
   const [reason, setReason] = useState('')
@@ -201,13 +220,14 @@ export function GuardrailsPage({ onLogout }: Props) {
     void client.invalidateQueries({ queryKey: ['proposals'] })
   }
   const submit = useMutation({ mutationFn: () => adminApi.propose(caseId, rule, reason), onSuccess: () => {
-    setCaseId(''); setRule(''); setReason(''); refresh()
+    setCaseId(''); setRule(''); setReason(''); setNotice('Proposal submitted.'); refresh()
   } })
   const decide = useMutation({
     mutationFn: ({ id, action }: { id: string; action: string }) => adminApi.decide(id, action, decisionNotes[id]),
-    onSuccess: refresh,
+    onSuccess: (_, { action }) => { setNotice(action === 'approve' ? 'Proposal approved.' : 'Proposal rejected.'); refresh() },
   })
   return <AdminLayout onLogout={onLogout}>
+    {notice && <SuccessNotice message={notice} dismiss={() => setNotice('')} />}
     <h1 className="text-3xl font-bold">Guardrails</h1>
     <RequestStatus pending={guardrails.isPending || proposals.isPending} error={guardrails.error || proposals.error || decide.error} />
     <section className={`${card} space-y-3`}>
@@ -223,10 +243,11 @@ export function GuardrailsPage({ onLogout }: Props) {
       <Field label="Application ID"><input className={input} value={caseId} onChange={event => setCaseId(event.target.value)} required /></Field>
       <Field label="Proposed rule"><textarea className={input} value={rule} onChange={event => setRule(event.target.value)} maxLength={4000} required /></Field>
       <Field label="Reason for change"><textarea className={input} value={reason} onChange={event => setReason(event.target.value)} maxLength={4000} required /></Field>
-      <RequestStatus error={submit.error} />
+      <RequestStatus pending={submit.isPending} label="Submitting proposal…" error={submit.error} />
       <Button type="submit" className="justify-self-start" disabled={submit.isPending}>Submit proposal</Button>
     </form>
     <section className="grid gap-3">
+      <RequestStatus pending={decide.isPending} label="Saving proposal decision…" />
       <h2 className="text-lg font-semibold">Proposals</h2>
       {proposals.data?.length === 0 && <p className={card}>No guardrail proposals yet.</p>}
       {proposals.data?.map(proposal => <article key={proposal.id} className={`${card} grid gap-3`}>

@@ -1,0 +1,18 @@
+CUSTOMER 360 DEMO | FICTIONAL OWNERSHIP REGISTER
+Sandbox evidence only. All names and addresses are fictional.
+
+Corporation: Cedar Finch Office Supplies Ltd.
+Demo registration reference: DEMO-ON-CF-001
+Directors: Jordan Vale and Taylor Reed
+Share class: Common voting shares
+Shares outstanding: 100
+
+Jordan Vale: 60 shares (60% direct ownership and voting control)
+Demo address: 20 Demo Cedar Lane, Ottawa, Ontario, Canada
+Taylor Reed: 40 shares (40% direct ownership and voting control)
+Demo address: 30 Demo Cedar Lane, Ottawa, Ontario, Canada
+
+The two listed individuals directly hold all outstanding shares. The demo
+register lists no intermediary entities or separate control arrangements.
+Both owners meet the 25% threshold. The register is supplied as case
+evidence and does not represent independent corroboration.

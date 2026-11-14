@@ -2,6 +2,7 @@
 
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -40,6 +41,13 @@ def agent_enabled() -> bool:
     return bool(os.getenv("ONBOARDING_CHAT_MODEL"))
 
 
+@lru_cache(maxsize=1)
+def _structured_model(model: str):
+    from langchain.chat_models import init_chat_model
+
+    return init_chat_model(model, timeout=25, max_retries=1).with_structured_output(IntakeDecision)
+
+
 def interpret_answer(
     step: int, content: str, recent_turns: list[dict[str, str]]
 ) -> IntakeDecision:
@@ -47,10 +55,8 @@ def interpret_answer(
     if not model:
         return IntakeDecision(action="accept", answer=content, reply="")
 
-    from langchain.chat_models import init_chat_model
-
     field, question = QUESTIONS[step]
-    structured_model = init_chat_model(model).with_structured_output(IntakeDecision)
+    structured_model = _structured_model(model)
     decision = structured_model.invoke([
         ("system", SYSTEM_INSTRUCTION),
         ("human", json.dumps({

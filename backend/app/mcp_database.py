@@ -61,9 +61,9 @@ class MCPDatabase:
             raise AttributeError(name)
         return self[name]
 
-    async def call(self, name, collection, **arguments):
+    async def call(self, tool_name, collection, **arguments):
         try:
-            return await tool(self.session, name, {
+            return await tool(self.session, tool_name, {
                 "connectionId": self.connection_id, "database": self.name,
                 "collection": collection, **arguments,
             })
