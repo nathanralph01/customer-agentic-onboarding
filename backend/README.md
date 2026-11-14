@@ -183,3 +183,33 @@ The workflow uses Atlas Managed MCP and needs permission to write the
 application, guardrail, and sandbox collections. Each application update stores
 its audit entry with the state change. It runs at each customer or bank handoff. Bank-entered risk, compliance review, and sandbox records demonstrate
 the handoffs while the model-driven workflow is being built.
+
+## Signed agreement agent demo
+
+New applications use the signed-agreement workflow. Existing cases keep their
+original sequence. Configure the Gemini-backed `ONBOARDING_CHAT_MODEL` and
+import the Canadian public references and fictional bank policies before the demo:
+
+```bash
+.venv/bin/python -m app.seed_reference_data --apply
+```
+
+1. Complete Business Onboarding in the customer workspace and submit the
+   application. Upload synthetic registration and ownership evidence as small
+   UTF-8 TXT files so the verification agent can read the contents.
+2. Switch to the bank persona. Start agreement preparation, generate the
+   versioned sandbox agreement, review it, and release it.
+3. Switch to the customer persona. Download the agreement, enter a sandbox
+   signature, then click **Return signed agreement**.
+4. Switch to the bank persona and select **Verify evidence and assess risk**.
+   The bank sees findings, cited Atlas references, risk scores and missing
+   evidence. The customer sees progress and any information requests.
+5. Resolve material gaps through **Request information** and rerun verification,
+   or reject with a reason. Approval requires a reason and provisions the
+   sandbox account after verifying the returned signature.
+
+The document agent drafts the cover note. The backend assembles a versioned TXT
+agreement and binds the in-app signature to its SHA-256 digest. Verification
+checks that binding and uses the small versioned Atlas reference corpus and
+readable TXT evidence. PDF and image uploads are visible as metadata. The bank
+decision uses demo persona routing and remains inside the sandbox.

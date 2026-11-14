@@ -461,6 +461,12 @@ async def list_documents(conversation_id: UUID, request: Request):
     return [document_response(document) for document in documents]
 
 
+async def check_conversation_upload_allowed(database, conversation):
+    record = await database.onboardings.find_one({"_id": conversation["onboarding_id"]})
+    if record and record.get("workflow") == "signed-agreement-v1" and record.get("stage", 0) >= 5:
+        raise HTTPException(409, "The evidence is locked for final bank review.")
+
+
 @app.post(
     "/api/v1/conversations/{conversation_id}/documents",
     response_model=DocumentResponse,
@@ -474,6 +480,7 @@ async def upload_document(
     database = get_database(request)
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversation = await _owned_conversation(database, customer_id, conversation_id)
+    await check_conversation_upload_allowed(database, conversation)
     return await store_upload(database, customer_id, conversation["onboarding_id"], file, conversation["_id"])
 
 
@@ -503,6 +510,7 @@ async def delete_document(conversation_id: UUID, document_id: str, request: Requ
     database = get_database(request)
     customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     conversation = await _owned_conversation(database, customer_id, conversation_id)
+    await check_conversation_upload_allowed(database, conversation)
     try:
         object_id = ObjectId(document_id)
     except InvalidId:

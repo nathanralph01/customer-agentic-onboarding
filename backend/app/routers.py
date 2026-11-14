@@ -1,5 +1,7 @@
 """Customer and bank employee APIs for the sandbox onboarding workflow."""
 
+import logging
+from hashlib import sha256
 from datetime import date, datetime, time, timezone
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
@@ -8,11 +10,16 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from .mcp_database import MCPDatabase as Database
+from starlette.concurrency import run_in_threadpool
+
+from .mcp_database import MCPBucket, MCPDatabase as Database
+from .workflow_agents import AgreementDraft, EvidenceCheck, RiskRecommendation, cited_sources, run_skill
 
 from .demo import _upsert_by_key, conversation_actor, ensure_demo_profile, get_actor, get_database, object_id
 from .documents import document_response, store_upload, stream_document
-from .workflow import GATES, REQUIRED_DOCUMENTS, RISK_POLICY, STEPS, TERMINAL, case_status, now, progress, transition
+from .workflow import GATES, REQUIRED_DOCUMENTS, RISK_POLICY, STEPS, TERMINAL, SIGNED_WORKFLOW, SIGNED_STATES, case_status, now, progress, transition, uses_signed_workflow, workflow_steps
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1")
 Db = Annotated[Database, Depends(get_database)]
@@ -133,7 +140,7 @@ async def start_application(payload: Application, database: Db, actor: Customer)
 
     if record is None or record["status"] == "DRAFT":
         fields = {
-            "status": "APPLIED", "stage": 0, "revision": 0, "application": application,
+            "status": "APPLIED", "workflow": SIGNED_WORKFLOW, "stage": 0, "revision": 0, "application": application,
             "required_documents": list(REQUIRED_DOCUMENTS),
             "requested_products": [item.strip() for item in payload.products.split(",") if item.strip()],
             "submitted_at": now(), "updated_at": now(), "current_step": STEPS[0],
@@ -179,6 +186,7 @@ async def case_documents(database, record, admin=False):
             "id": str(packet["_id"]), "filename": "Sandbox banking agreement.txt",
             "contentType": "text/plain", "sizeBytes": len(packet["content"].encode()),
             "createdAt": packet["created_at"].isoformat(), "source": "generated",
+            "coverNote": packet.get("cover_note"),
         })
     return documents
 
@@ -193,6 +201,8 @@ async def upload_case_document(onboarding_id: str, database: Db, actor: Customer
     record = await case(database, onboarding_id, actor[0])
     if case_status(record) in TERMINAL:
         raise HTTPException(409, "This onboarding no longer accepts uploads.")
+    if uses_signed_workflow(record) and record["stage"] == 5:
+        raise HTTPException(409, "Wait for the bank to reopen the application before uploading evidence.")
     return await store_upload(database, actor[0], record["_id"], file)
 
 
@@ -234,6 +244,21 @@ async def supply_information(onboarding_id: str, payload: Information, database:
 async def sign(onboarding_id: str, payload: Signature, database: Db, actor: Customer):
     record = await case(database, onboarding_id, actor[0])
     status = case_status(record)
+    if uses_signed_workflow(record):
+        if status != "AWAITING_SIGNATURE" or not record.get("documents_released"):
+            raise HTTPException(409, "This application is not ready to sign.")
+        packet = await released_agreement(database, record)
+        signature = await database.sandbox_signatures.upsert({"_id": record["_id"]}, {
+            "signer": payload.signer, "signed_at": now(), "actor_id": actor[1],
+            "digest": packet["digest"], "template_version": packet["template_version"],
+        })
+        if signature["signer"] != payload.signer or signature.get("digest") != packet["digest"]:
+            raise HTTPException(409, "A different signature already exists.")
+        if record.get("agreement_signed"):
+            return progress(record)
+        return progress(await change(
+            database, record, {"agreement_signed": True}, actor[1], "customer", "sign",
+        ))
     if status in {"PROVISIONING", "ONBOARDED"}:
         signature = await database.sandbox_signatures.find_one({"_id": record["_id"]})
         if signature and signature["signer"] == payload.signer:
@@ -251,6 +276,39 @@ async def sign(onboarding_id: str, payload: Signature, database: Db, actor: Cust
     ))
 
 
+async def released_agreement(database, record):
+    packet = await database.sandbox_documents.find_one({"_id": record["_id"]})
+    if not packet or not packet.get("digest") or packet["digest"] != record.get("released_digest"):
+        raise HTTPException(409, "The released agreement could not be verified.")
+    if sha256(packet["content"].encode()).hexdigest() != packet["digest"]:
+        raise HTTPException(409, "The released agreement content does not match its version.")
+    return packet
+
+
+async def checked_signature(database, record):
+    packet = await released_agreement(database, record)
+    signature = await database.sandbox_signatures.find_one({"_id": record["_id"]})
+    if not signature or signature.get("digest") != packet["digest"] or signature.get("template_version") != packet["template_version"]:
+        raise HTTPException(409, "The signature does not match the released agreement.")
+    return signature
+
+
+@router.post("/customer/onboardings/{onboarding_id}/return-agreement")
+async def return_agreement(onboarding_id: str, database: Db, actor: Customer):
+    record = await case(database, onboarding_id, actor[0])
+    if not uses_signed_workflow(record):
+        raise HTTPException(409, "This application uses the original signing flow.")
+    if record.get("agreement_returned"):
+        return progress(record)
+    if case_status(record) != "AWAITING_SIGNATURE" or not record.get("agreement_signed"):
+        raise HTTPException(409, "Sign the released agreement before returning it.")
+    await checked_signature(database, record)
+    return progress(await change(database, record, {
+        "agreement_returned": True, "stage": 4, "status": "VERIFYING",
+        "current_step": workflow_steps(record)[4],
+    }, actor[1], "customer", "return_signed_agreement"))
+
+
 @router.get("/customer/onboardings/{onboarding_id}/summary")
 async def summary(onboarding_id: str, database: Db, actor: Customer):
     record = await case(database, onboarding_id, actor[0])
@@ -266,7 +324,7 @@ async def summary(onboarding_id: str, database: Db, actor: Customer):
 
 
 def admin_progress(row):
-    return {**progress(row), "riskTier": row.get("risk", {}).get("tier")}
+    return {**progress(row), "riskTier": (row.get("risk") or {}).get("tier")}
 
 
 @router.get("/admin/onboardings")
@@ -278,7 +336,6 @@ async def admin_cases(database: Db, actor: Admin, status: str | None = None,
     if sector:
         query["application.sector"] = sector
     if since:
-        from datetime import date, datetime, time, timezonetime, time, timezone
         query["submitted_at"] = {"$gte": datetime.combine(since, time.min, tzinfo=timezone.utc)}
     records = await database.onboardings.find(query, sort=("updated_at", -1))
     return [admin_progress(row) for row in records if not status or case_status(row) == status]
@@ -287,7 +344,10 @@ async def admin_cases(database: Db, actor: Admin, status: str | None = None,
 @router.get("/admin/reviews")
 async def review_queue(database: Db, actor: Admin):
     return [admin_progress(row) for row in await database.onboardings.find({
-        "status": "ADMIN_REVIEW", "stage": {"$in": list(GATES)},
+        "status": "ADMIN_REVIEW", "$or": [
+            {"workflow": SIGNED_WORKFLOW, "stage": {"$in": [2, 5]}},
+            {"workflow": {"$ne": SIGNED_WORKFLOW}, "stage": {"$in": list(GATES)}},
+        ],
     }, sort=("updated_at", -1))]
 
 
@@ -309,10 +369,10 @@ async def admin_case(onboarding_id: str, database: Db, actor: Admin):
     history.extend(record.get("audit_history", []))
     history.sort(key=lambda event: event["created_at"])
     return {
-        **admin_progress(record), "risk": record.get("risk"),
+        **admin_progress(record), "risk": record.get("risk"), "verification": record.get("verification"),
         "documents": await case_documents(database, record, admin=True), "history": history,
         "actions": await action_trace(database, record),
-        "checkpoint": {"step": STEPS[record["stage"]], "revision": record["revision"]},
+        "checkpoint": {"step": workflow_steps(record)[record["stage"]], "revision": record["revision"]},
     }
 
 
@@ -390,6 +450,8 @@ async def review(onboarding_id: str, payload: Review, database: Db, actor: Admin
     record = await case(database, onboarding_id)
     if record["revision"] != payload.revision:
         raise HTTPException(409, "This application changed. Reload and try again.")
+    if uses_signed_workflow(record):
+        return await signed_workflow_review(database, record, payload, actor)
     comments = payload.comments.strip()
     updates = transition(record, payload.decision, comments)
     if updates["status"] == "PROVISIONING":
@@ -441,7 +503,7 @@ async def review(onboarding_id: str, payload: Review, database: Db, actor: Admin
 async def workflow_run(onboarding_id: str, database: Db, actor: Admin):
     record = await case(database, onboarding_id)
     return {
-        "status": case_status(record), "currentNode": STEPS[record["stage"]],
+        "status": case_status(record), "currentNode": workflow_steps(record)[record["stage"]],
         "checkpoint": record["revision"], "actions": await action_trace(database, record),
     }
 
@@ -531,3 +593,137 @@ async def decide_proposal(proposal_id: str, payload: ProposalDecision, database:
         "decidedBy": str(actor), "decidedAt": now(),
     }})
     return {"status": decision}
+
+
+async def agent_result(skill, schema, context, references=None):
+    try:
+        report = await run_in_threadpool(run_skill, skill, schema, context)
+        return report, cited_sources(report, references) if references is not None else []
+    except Exception as error:
+        logger.warning("Workflow agent %s failed (%s)", skill, type(error).__name__)
+        raise HTTPException(503, "The workflow agent could not complete this step. Check the model setup and retry.") from None
+
+
+async def prepare_agreement(database, record):
+    packet = await database.sandbox_documents.find_one({"_id": record["_id"]})
+    if packet:
+        if not packet.get("digest"):
+            raise HTTPException(409, "An incompatible agreement already exists for this application.")
+        return
+    application = {key: record["application"][key] for key in ("businessName", "registration", "products")}
+    draft, _ = await agent_result("document-generation", AgreementDraft, {"application": application})
+    if draft.missingFields:
+        raise HTTPException(422, "Agreement fields need review: " + ", ".join(draft.missingFields))
+    content = (
+        "Customer 360 sandbox business banking agreement\n"
+        "Template version: 1\n"
+        f"Application: {record['_id']}\n\n"
+        f"Legal business name: {application['businessName']}\n"
+        f"Registration: {application['registration']}\n"
+        f"Requested products: {application['products']}\n\n"
+        "Demo agreement for a sandbox banking account. No real account, pricing or legal obligation is created.\n"
+        "Use the onboarding workspace to record and return a sandbox signature.\n"
+    )
+    await sandbox_effect(database, record, "prepare-agreement", "sandbox_documents", {
+        "content": content, "template_version": 1, "digest": sha256(content.encode()).hexdigest(),
+        "cover_note": draft.coverNote,
+    })
+
+
+async def final_reports(database, record, actor):
+    signature = await checked_signature(database, record)
+    filter_by = {"dataset": "customer360-onboarding-reference", "jurisdiction": "CA", "version": 1}
+    references = [
+        *await database.regulations.find(filter_by),
+        *await database.procedures.find(filter_by),
+    ]
+    if not references or {source["kind"] for source in references} <= {"demo_bank_policy"} or not any(
+        source["kind"] == "demo_bank_policy" for source in references
+    ):
+        raise HTTPException(409, "Load the Canadian regulatory references and bank procedures before running verification.")
+    documents = await database.documents.find({"onboarding_id": record["_id"], "source": "uploaded"})
+    evidence = []
+    for document in documents:
+        item = {"id": str(document["_id"]), "filename": document["filename"]}
+        if document["content_type"] == "text/plain" and document["size_bytes"] <= 12000:
+            content = await MCPBucket(database).read(document["storage_id"])
+            item["text"] = content.decode("utf-8", errors="replace")
+        evidence.append(item)
+    policy = await risk_policy(database, actor)
+    context = {
+        "application": record["application"], "responses": record.get("information_responses", []),
+        "signed_agreement": {"digest": signature["digest"], "template_version": signature["template_version"]},
+        "uploaded_evidence": evidence,
+        "references": [
+            {key: source[key] for key in ("_id", "kind", "citation", "text", "version")}
+            for source in references
+        ],
+        "bank_policy": policy,
+    }
+    verification, sources = await agent_result("risk-assessment", EvidenceCheck, {
+        **context, "task": "Verify the evidence against applicable requirements and identify gaps.",
+    }, references)
+    verified = {**verification.model_dump(), "sources": sources, "agreementDigest": signature["digest"]}
+    risk, citations = await agent_result("risk-assessment", RiskRecommendation, {
+        **context, "verification": verified, "task": "Draft the final bank risk recommendation.",
+    }, references)
+    highest = max(risk.ownership, risk.activity, risk.geography)
+    return {
+        "verification": verified,
+        "risk": {
+            **risk.model_dump(), "tier": "high" if highest >= 4 else "medium" if highest == 3 else "low",
+            "missingInputs": list(dict.fromkeys([*verification.missingInputs, *risk.missingInputs])),
+            "evidence": [source["citation"] for source in citations],
+            "sources": citations, "policyVersion": policy["version"], "source": "agent", "reviewedAt": now(),
+        },
+    }
+
+
+async def signed_workflow_review(database, record, payload, actor):
+    stage = record["stage"]
+    status = case_status(record)
+    comments = payload.comments.strip()
+    if payload.risk is not None:
+        raise HTTPException(422, "Final risk is generated from the returned agreement and case evidence.")
+    if status in TERMINAL:
+        raise HTTPException(409, "This onboarding is closed.")
+    if payload.decision == "cancel":
+        if not comments:
+            raise HTTPException(422, "Enter the reason for rejecting this application.")
+        return admin_progress(await change(database, record, {"status": "CANCELLED", "rejected": True}, actor, "admin", "reject", comments))
+    if payload.decision != "continue" or status == "PAUSED":
+        updates = transition(record, payload.decision, comments)
+        if updates["status"] == "NEEDS_INFO" and stage == 5:
+            updates.update({
+                "stage": 4, "resume_status": "VERIFYING", "current_step": workflow_steps(record)[4],
+                "risk": None, "verification": None,
+            })
+        return admin_progress(await change(database, record, updates, actor, "admin", payload.decision, comments))
+    if status != SIGNED_STATES[stage] or stage == 3:
+        raise HTTPException(409, "This action is unavailable at the current step.")
+
+    updates = {"status": SIGNED_STATES[stage + 1], "stage": stage + 1, "current_step": workflow_steps(record)[stage + 1]}
+    if stage == 1:
+        await prepare_agreement(database, record)
+    elif stage == 2:
+        packet = await database.sandbox_documents.find_one({"_id": record["_id"]})
+        if not packet or not packet.get("digest"):
+            raise HTTPException(409, "Prepare the agreement before releasing it.")
+        updates.update({"documents_released": True, "released_digest": packet["digest"]})
+    elif stage == 4:
+        if not record.get("agreement_returned"):
+            raise HTTPException(409, "The customer must return the signed agreement first.")
+        updates.update(await final_reports(database, record, actor))
+    elif stage == 5:
+        if not comments:
+            raise HTTPException(422, "Enter the reason for approving this application.")
+        if not record.get("risk") or record["risk"]["missingInputs"]:
+            raise HTTPException(422, "Resolve the material evidence gaps before approval.")
+        signature = await checked_signature(database, record)
+        if (record.get("verification") or {}).get("agreementDigest") != signature["digest"]:
+            raise HTTPException(409, "Verify the returned agreement before approval.")
+        await sandbox_effect(database, record, "provision", "sandbox_accounts", {
+            "reference": f"DEMO-{str(record['_id']).upper()}", "status": "active", "signer": signature["signer"],
+        })
+    action = {1: "generate_agreement", 2: "release_agreement", 4: "verify_and_assess", 5: "approve"}.get(stage, "continue")
+    return admin_progress(await change(database, record, updates, actor, "admin", action, comments))

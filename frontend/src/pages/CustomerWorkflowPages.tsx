@@ -90,9 +90,10 @@ export function CustomerCasePage({ onLogout }: Props) {
   const documents = useQuery({ queryKey: ['case-documents', id], queryFn: () => customerApi.documents(id), enabled: !!query.data, refetchInterval: 4000 })
   const summary = useQuery({ queryKey: ['summary', id], queryFn: () => customerApi.summary(id), enabled: query.data?.status === 'ONBOARDED' })
   const mutation = useMutation({
-    mutationFn: async (action: 'info' | 'sign' | File) => {
+    mutationFn: async (action: 'info' | 'sign' | 'return' | File) => {
       if (action === 'info') return customerApi.information(id, response)
       if (action === 'sign') return customerApi.sign(id, signer)
+      if (action === 'return') return customerApi.returnAgreement(id)
       return customerApi.upload(id, action)
     },
     onSuccess: (_, action) => {
@@ -111,7 +112,7 @@ export function CustomerCasePage({ onLogout }: Props) {
       <Link to="/customer/cases" className="text-sm font-medium text-primary hover:underline">Back to applications</Link>
       <RequestStatus pending={query.isPending} error={query.error} />
       {item && <>
-        <div><h1 className="text-3xl font-bold">{item.application.businessName}</h1><p className="mt-2 text-xs text-muted-foreground">Application {item.id}</p><p className="mt-2 text-sm font-semibold capitalize">{statusLabel(item.status)}</p></div>
+        <div><h1 className="text-3xl font-bold">{item.application.businessName}</h1><p className="mt-2 text-xs text-muted-foreground">Application {item.id}</p><p className="mt-2 text-sm font-semibold capitalize">{item.rejected ? 'rejected' : statusLabel(item.status)}</p></div>
         <section className={card}>
           <h2 className="text-lg font-semibold">Onboarding progress</h2>
           <ol className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
@@ -134,7 +135,7 @@ export function CustomerCasePage({ onLogout }: Props) {
           {item.requiredDocuments.length > 0 && <p className="text-sm text-muted-foreground">Requested documents: {item.requiredDocuments.join(', ')}.</p>}
           <RequestStatus pending={documents.isPending} error={documents.error} />
           {documents.data && <Documents documents={documents.data} download={document => download.mutate(document)} />}
-          {caseOpen(item.status) && <>
+          {caseOpen(item.status) && !(item.signedWorkflow && item.stage === 5) && <>
             <input ref={fileInput} type="file" accept=".pdf,.docx,.txt,.csv,.png,.jpg,.jpeg" aria-label="Upload supporting document" className="sr-only" tabIndex={-1} onChange={event => {
               const file = event.target.files?.[0]
               if (file) mutation.mutate(file)
@@ -143,7 +144,12 @@ export function CustomerCasePage({ onLogout }: Props) {
             <Button variant="outline" disabled={mutation.isPending} onClick={() => fileInput.current?.click()}>Upload document</Button>
           </>}
         </section>
-        {item.status === 'AWAITING_SIGNATURE' && <form className={`${card} space-y-3`} onSubmit={event => { event.preventDefault(); mutation.mutate('sign') }}>
+        {item.status === 'AWAITING_SIGNATURE' && item.signedWorkflow && item.agreementSigned && <section className={`${card} space-y-3`}>
+          <h2 className="text-lg font-semibold">Return your signed agreement</h2>
+          <p className="text-sm text-muted-foreground">Your sandbox signature is saved. Return the signed agreement for bank review.</p>
+          <Button disabled={mutation.isPending} onClick={() => mutation.mutate('return')}>Return signed agreement</Button>
+        </section>}
+        {item.status === 'AWAITING_SIGNATURE' && !item.agreementSigned && <form className={`${card} space-y-3`} onSubmit={event => { event.preventDefault(); mutation.mutate('sign') }}>
           <h2 className="text-lg font-semibold">Sign the sandbox agreement</h2>
           <p className="text-sm text-muted-foreground">Review the agreement above, then enter the synthetic signer’s name.</p>
           <Field label="Signer’s name"><input className={input} value={signer} onChange={event => setSigner(event.target.value)} required maxLength={4000} /></Field>
