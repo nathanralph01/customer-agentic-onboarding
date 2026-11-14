@@ -2,15 +2,13 @@
 
 from datetime import date, datetime, time, timezone
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
-from pymongo import ReturnDocument
-from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError
+from .mcp_database import MCPDatabase as Database
 
 from .demo import _upsert_by_key, conversation_actor, ensure_demo_profile, get_actor, get_database, object_id
 from .documents import document_response, store_upload, stream_document
@@ -63,12 +61,12 @@ class ProposalDecision(BaseModel):
     comments: Text
 
 
-def customer_actor(database: Db, customer_id: str):
-    return conversation_actor(database, customer_id)
+async def customer_actor(database: Db, customer_id: str):
+    return await conversation_actor(database, customer_id)
 
 
-def admin_actor(database: Db, admin_id: str | None = None):
-    return get_actor(database, "admin", admin_id)
+async def admin_actor(database: Db, admin_id: str | None = None):
+    return await get_actor(database, "admin", admin_id)
 
 
 Customer = Annotated[tuple[ObjectId, ObjectId], Depends(customer_actor)]
@@ -76,118 +74,106 @@ Admin = Annotated[ObjectId, Depends(admin_actor)]
 
 
 @router.get("/demo/users")
-def personas(database: Db):
-    customer_id, user_id = ensure_demo_profile(database)
-    admin = _upsert_by_key(database.users, {"email": "reviewer.demo@customer360.example"}, {
+async def personas(database: Db):
+    customer_id, user_id = await ensure_demo_profile(database)
+    admin = await _upsert_by_key(database.users, {"email": "reviewer.demo@customer360.example"}, {
         "name": "Morgan Lee", "role": "admin", "email": "reviewer.demo@customer360.example", "created_at": now(),
     })
-    customer = database.users.find_one({"_id": user_id})
+    customer = await database.users.find_one({"_id": user_id})
     return [
         {"id": str(user_id), "customerId": str(customer_id), "name": customer["name"], "role": "customer"},
         {"id": str(admin["_id"]), "customerId": None, "name": admin["name"], "role": "admin"},
     ]
 
 
-def case(database, onboarding_id, customer_id=None):
+async def case(database, onboarding_id, customer_id=None):
     query = {"_id": object_id(onboarding_id), "status": {"$ne": "DRAFT"}}
     if customer_id is not None:
         query["customer_id"] = customer_id
-    record = database.onboardings.find_one(query)
+    record = await database.onboardings.find_one(query)
     if record is None:
         raise HTTPException(404, "Onboarding not found.")
     return record
 
 
-def audit(database, session, record, actor, role, action, previous, comments):
-    database.audit_log.insert_one({
-        "onboarding_id": record["_id"], "actor_id": str(actor), "role": role,
-        "action": action, "from": previous, "to": case_status(record),
-        "stage": record["stage"], "reason": comments, "created_at": now(),
-    }, session=session)
+def audit_event(record, actor, role, action, previous, comments):
+    return {
+        "actor_id": str(actor), "role": role, "action": action, "from": previous,
+        "to": case_status(record), "stage": record["stage"], "reason": comments,
+        "created_at": now(),
+    }
 
 
-def change(database, session, record, updates, actor, role, action, comments=""):
-    updated = database.onboardings.find_one_and_update(
-        {"_id": record["_id"], "revision": record["revision"]},
-        {"$set": {**updates, "updated_at": now()}, "$inc": {"revision": 1}},
-        return_document=ReturnDocument.AFTER,
-        session=session,
-    )
-    if updated is None:
+async def change(database, record, updates, actor, role, action, comments="", override=None):
+    event = audit_event({**record, **updates}, actor, role, action, case_status(record), comments)
+    push = {"audit_history": event}
+    if override:
+        push["risk_overrides"] = override
+    query = {"_id": record["_id"], "revision": record["revision"]}
+    transition_id = str(uuid4())
+    await database.onboardings.update_one(query, {
+        "$set": {**updates, "last_transition": transition_id, "updated_at": event["created_at"]},
+        "$inc": {"revision": 1}, "$push": push,
+    })
+    updated = await database.onboardings.find_one({"_id": record["_id"]})
+    if not updated or updated.get("last_transition") != transition_id:
         raise HTTPException(409, "This application changed. Reload and try again.")
-    audit(database, session, updated, actor, role, action, case_status(record), comments)
     return updated
 
 
-def transact(database, callback):
-    with database.client.start_session() as session:
-        return session.with_transaction(callback)
-
-
 @router.post("/customer/onboardings", status_code=201)
-def start_application(payload: Application, database: Db, actor: Customer):
+async def start_application(payload: Application, database: Db, actor: Customer):
     customer_id, user_id = actor
     client_id = str(payload.conversationId or payload.id)
     application = payload.model_dump(exclude={"id", "conversationId"})
+    lookup = {"customer_id": customer_id, "client_id": client_id}
+    record = await database.onboardings.find_one(lookup)
+    if payload.conversationId and record is None:
+        raise HTTPException(404, "Conversation draft not found.")
 
-    def submit(session):
-        lookup = {"customer_id": customer_id, "client_id": client_id}
-        record = database.onboardings.find_one(lookup, session=session)
-        if record and record["status"] != "DRAFT":
-            if record.get("application") == application:
-                return progress(record)
-            raise HTTPException(409, "This draft has already been submitted.")
-        if payload.conversationId and record is None:
-            raise HTTPException(404, "Conversation draft not found.")
+    if record is None or record["status"] == "DRAFT":
         fields = {
             "status": "APPLIED", "stage": 0, "revision": 0, "application": application,
             "required_documents": list(REQUIRED_DOCUMENTS),
             "requested_products": [item.strip() for item in payload.products.split(",") if item.strip()],
             "submitted_at": now(), "updated_at": now(), "current_step": STEPS[0],
         }
+        fields["audit_history"] = [audit_event(
+            fields, user_id, "customer", "submit", "DRAFT" if record else None, "",
+        )]
         if record:
-            query = {"_id": record["_id"], "status": "DRAFT"}
-        else:
-            query = lookup
-        saved = database.onboardings.find_one_and_update(
-            query, {"$set": fields, "$setOnInsert": {**lookup, "created_at": now(), "created_by": user_id}},
-            upsert=record is None, return_document=ReturnDocument.AFTER, session=session,
-        )
-        if payload.conversationId:
-            database.conversations.update_one(
-                {"client_id": client_id, "customer_id": customer_id},
-                {"$set": {"application_submitted": True}},
-                session=session,
+            await database.onboardings.update_one(
+                {"_id": record["_id"], "status": "DRAFT"}, {"$set": fields},
             )
-        audit(database, session, saved, user_id, "customer", "submit", "DRAFT" if record else None, "")
-        return progress(saved)
-
-    try:
-        return transact(database, submit)
-    except DuplicateKeyError:
-        existing = database.onboardings.find_one({"customer_id": customer_id, "client_id": client_id})
-        if existing and existing.get("application") == application:
-            return progress(existing)
-        raise HTTPException(409, "Application ID is already in use.") from None
+        else:
+            await database.onboardings.upsert(lookup, {
+                **lookup, **fields, "created_at": now(), "created_by": user_id,
+            })
+        record = await database.onboardings.find_one(lookup)
+    if record is None or record.get("application") != application:
+        raise HTTPException(409, "This draft has already been submitted.")
+    if payload.conversationId:
+        await database.conversations.update_one(lookup, {"$set": {"application_submitted": True}})
+    return progress(record)
 
 
 @router.get("/customer/onboardings")
-def customer_cases(database: Db, actor: Customer):
-    return [progress(row) for row in database.onboardings.find({
+async def customer_cases(database: Db, actor: Customer):
+    return [progress(row) for row in await database.onboardings.find({
         "customer_id": actor[0], "status": {"$ne": "DRAFT"},
-    }).sort("updated_at", -1)]
+    }, sort=("updated_at", -1))]
 
 
 @router.get("/customer/onboardings/{onboarding_id}")
-def customer_case(onboarding_id: str, database: Db, actor: Customer):
-    return progress(case(database, onboarding_id, actor[0]))
+async def customer_case(onboarding_id: str, database: Db, actor: Customer):
+    return progress(await case(database, onboarding_id, actor[0]))
 
 
-def case_documents(database, record, admin=False):
-    documents = [document_response(doc) for doc in database.documents.find({
+async def case_documents(database, record, admin=False):
+    documents = [document_response(doc) for doc in await database.documents.find({
         "onboarding_id": record["_id"], "source": {"$ne": "generated"},
-    }).sort("created_at", 1)]
-    packet = database.sandbox_documents.find_one({"_id": record["_id"]})
+    }, sort=("created_at", 1))]
+    packet = await database.sandbox_documents.find_one({"_id": record["_id"]})
     if packet and (admin or record.get("documents_released")):
         documents.append({
             "id": str(packet["_id"]), "filename": "Sandbox banking agreement.txt",
@@ -198,90 +184,84 @@ def case_documents(database, record, admin=False):
 
 
 @router.get("/customer/onboardings/{onboarding_id}/documents")
-def customer_documents(onboarding_id: str, database: Db, actor: Customer):
-    return case_documents(database, case(database, onboarding_id, actor[0]))
+async def customer_documents(onboarding_id: str, database: Db, actor: Customer):
+    return await case_documents(database, await case(database, onboarding_id, actor[0]))
 
 
 @router.post("/customer/onboardings/{onboarding_id}/documents", status_code=201)
-def upload_case_document(onboarding_id: str, database: Db, actor: Customer, file: UploadFile = File(...)):
-    record = case(database, onboarding_id, actor[0])
+async def upload_case_document(onboarding_id: str, database: Db, actor: Customer, file: UploadFile = File(...)):
+    record = await case(database, onboarding_id, actor[0])
     if case_status(record) in TERMINAL:
         raise HTTPException(409, "This onboarding no longer accepts uploads.")
-    return store_upload(database, actor[0], record["_id"], file)
+    return await store_upload(database, actor[0], record["_id"], file)
 
 
-def download_case_document(database, record, document_id, admin=False):
+async def download_case_document(database, record, document_id, admin=False):
     if document_id == str(record["_id"]) and (admin or record.get("documents_released")):
-        packet = database.sandbox_documents.find_one({"_id": record["_id"]})
+        packet = await database.sandbox_documents.find_one({"_id": record["_id"]})
         if packet:
             return Response(packet["content"], media_type="text/plain", headers={
                 "Content-Disposition": 'attachment; filename="sandbox-banking-agreement.txt"',
             })
-    document = database.documents.find_one({
+    document = await database.documents.find_one({
         "_id": object_id(document_id), "onboarding_id": record["_id"], "source": {"$ne": "generated"},
     })
     if document is None:
         raise HTTPException(404, "Document not found.")
-    return stream_document(database, document)
+    return await stream_document(database, document)
 
 
 @router.get("/customer/onboardings/{onboarding_id}/documents/{document_id}")
-def customer_download(onboarding_id: str, document_id: str, database: Db, actor: Customer):
-    return download_case_document(database, case(database, onboarding_id, actor[0]), document_id)
+async def customer_download(onboarding_id: str, document_id: str, database: Db, actor: Customer):
+    return await download_case_document(database, await case(database, onboarding_id, actor[0]), document_id)
 
 
 @router.post("/customer/onboardings/{onboarding_id}/information")
-def supply_information(onboarding_id: str, payload: Information, database: Db, actor: Customer):
-    record = case(database, onboarding_id, actor[0])
+async def supply_information(onboarding_id: str, payload: Information, database: Db, actor: Customer):
+    record = await case(database, onboarding_id, actor[0])
     if record["status"] != "NEEDS_INFO":
         raise HTTPException(409, "This application has no open information request.")
     responses = [*record.get("information_responses", []), {
         "request": record["requested_information"], "response": payload.response, "createdAt": now(),
     }]
-    updated = transact(database, lambda session: change(database, session, record, {
+    updated = await change(database, record, {
         "status": record["resume_status"], "information_responses": responses,
-    }, actor[1], "customer", "supply_information"))
+    }, actor[1], "customer", "supply_information")
     return progress(updated)
 
 
 @router.post("/customer/onboardings/{onboarding_id}/sign")
-def sign(onboarding_id: str, payload: Signature, database: Db, actor: Customer):
-    record = case(database, onboarding_id, actor[0])
+async def sign(onboarding_id: str, payload: Signature, database: Db, actor: Customer):
+    record = await case(database, onboarding_id, actor[0])
     status = case_status(record)
     if status in {"PROVISIONING", "ONBOARDED"}:
-        signature = database.sandbox_signatures.find_one({"_id": record["_id"]})
+        signature = await database.sandbox_signatures.find_one({"_id": record["_id"]})
         if signature and signature["signer"] == payload.signer:
             return progress(record)
     if status != "AWAITING_SIGNATURE" or not record.get("documents_released"):
         raise HTTPException(409, "This application is not ready to sign.")
 
-    def persist(session):
-        database.sandbox_signatures.insert_one({
-            "_id": record["_id"], "signer": payload.signer, "signed_at": now(), "actor_id": actor[1],
-        }, session=session)
-        return change(database, session, record, {"stage": 8, "current_step": STEPS[8]}, actor[1], "customer", "sign")
-
-    try:
-        return progress(transact(database, persist))
-    except DuplicateKeyError:
-        latest = case(database, onboarding_id, actor[0])
-        signature = database.sandbox_signatures.find_one({"_id": record["_id"]})
-        if signature and signature["signer"] == payload.signer and case_status(latest) in {"PROVISIONING", "ONBOARDED"}:
-            return progress(latest)
-        raise HTTPException(409, "This agreement is already signed.") from None
+    signature = await database.sandbox_signatures.upsert({"_id": record["_id"]}, {
+        "_id": record["_id"], "signer": payload.signer, "signed_at": now(), "actor_id": actor[1],
+    })
+    if signature["signer"] != payload.signer:
+        raise HTTPException(409, "This agreement is already signed.")
+    return progress(await change(
+        database, record, {"stage": 8, "current_step": STEPS[8]}, actor[1], "customer", "sign",
+    ))
 
 
 @router.get("/customer/onboardings/{onboarding_id}/summary")
-def summary(onboarding_id: str, database: Db, actor: Customer):
-    record = case(database, onboarding_id, actor[0])
-    account = database.sandbox_accounts.find_one({"_id": record["_id"]})
+async def summary(onboarding_id: str, database: Db, actor: Customer):
+    record = await case(database, onboarding_id, actor[0])
+    account = await database.sandbox_accounts.find_one({"_id": record["_id"]})
     if record["status"] != "ONBOARDED" or not account:
         raise HTTPException(409, "The sandbox account is still pending.")
     return {
         "accountReference": account["reference"], "status": account["status"],
         "products": record["requested_products"], "benefits": ["Business banking onboarding completed"],
         "access": "Sandbox account. Contact Customer Onboarding for the demo walkthrough.",
-        "documents": case_documents(database, record),
+        "documents": await case_documents(database, record),
     }
 
 
@@ -290,7 +270,7 @@ def admin_progress(row):
 
 
 @router.get("/admin/onboardings")
-def admin_cases(database: Db, actor: Admin, status: str | None = None,
+async def admin_cases(database: Db, actor: Admin, status: str | None = None,
                 risk: str | None = None, sector: str | None = None, since: date | None = None):
     query = {"status": {"$ne": "DRAFT"}}
     if risk:
@@ -300,51 +280,55 @@ def admin_cases(database: Db, actor: Admin, status: str | None = None,
     if since:
         from datetime import date, datetime, time, timezonetime, time, timezone
         query["submitted_at"] = {"$gte": datetime.combine(since, time.min, tzinfo=timezone.utc)}
-    records = database.onboardings.find(query).sort("updated_at", -1)
+    records = await database.onboardings.find(query, sort=("updated_at", -1))
     return [admin_progress(row) for row in records if not status or case_status(row) == status]
 
 
 @router.get("/admin/reviews")
-def review_queue(database: Db, actor: Admin):
-    return [admin_progress(row) for row in database.onboardings.find({
+async def review_queue(database: Db, actor: Admin):
+    return [admin_progress(row) for row in await database.onboardings.find({
         "status": "ADMIN_REVIEW", "stage": {"$in": list(GATES)},
-    }).sort("updated_at", -1)]
+    }, sort=("updated_at", -1))]
 
 
-def action_trace(database, record):
-    actions = database.workflow_actions.find(
-        {"onboarding_id": str(record["_id"])}
-    ).sort("created_at", 1)
+async def action_trace(database, record):
+    actions = await database.workflow_actions.find(
+        {"onboarding_id": str(record["_id"])}, sort=("created_at", 1),
+    )
     return [{**row, "id": row["_id"]} for row in actions]
 
 
 @router.get("/admin/onboardings/{onboarding_id}")
-def admin_case(onboarding_id: str, database: Db, actor: Admin):
-    record = case(database, onboarding_id)
-    history = list(database.audit_log.find(
-        {"onboarding_id": record["_id"]}, {"_id": 0, "onboarding_id": 0},
-    ).sort("created_at", 1))
+async def admin_case(onboarding_id: str, database: Db, actor: Admin):
+    record = await case(database, onboarding_id)
+    history = await database.audit_log.find(
+        {"onboarding_id": record["_id"]}, projection={"onboarding_id": 0}, sort=("created_at", 1),
+    )
+    for event in history:
+        event.pop("_id", None)
+    history.extend(record.get("audit_history", []))
+    history.sort(key=lambda event: event["created_at"])
     return {
         **admin_progress(record), "risk": record.get("risk"),
-        "documents": case_documents(database, record, admin=True), "history": history,
-        "actions": action_trace(database, record),
+        "documents": await case_documents(database, record, admin=True), "history": history,
+        "actions": await action_trace(database, record),
         "checkpoint": {"step": STEPS[record["stage"]], "revision": record["revision"]},
     }
 
 
 @router.get("/admin/onboardings/{onboarding_id}/documents/{document_id}")
-def admin_download(onboarding_id: str, document_id: str, database: Db, actor: Admin):
-    return download_case_document(database, case(database, onboarding_id), document_id, admin=True)
+async def admin_download(onboarding_id: str, document_id: str, database: Db, actor: Admin):
+    return await download_case_document(database, await case(database, onboarding_id), document_id, admin=True)
 
 
 @router.get("/admin/onboardings/{onboarding_id}/risk")
-def risk_result(onboarding_id: str, database: Db, actor: Admin):
-    return case(database, onboarding_id).get("risk")
+async def risk_result(onboarding_id: str, database: Db, actor: Admin):
+    return (await case(database, onboarding_id)).get("risk")
 
 
 @router.get("/admin/risk-appetite")
-def risk_policy(database: Db, actor: Admin, sector: str | None = None, customer_type: str | None = None):
-    guardrail = database.guardrails.find_one({"_id": RISK_POLICY["key"]})
+async def risk_policy(database: Db, actor: Admin, sector: str | None = None, customer_type: str | None = None):
+    guardrail = await database.guardrails.find_one({"_id": RISK_POLICY["key"]})
     return {
         **RISK_POLICY, "sector": sector, "customerType": customer_type,
         "version": guardrail["active_version"] if guardrail else RISK_POLICY["version"],
@@ -352,38 +336,38 @@ def risk_policy(database: Db, actor: Admin, sector: str | None = None, customer_
     }
 
 
-def sandbox_effect(database, record, key, target, expected):
+async def sandbox_effect(database, record, key, target, expected):
     """Persist intent before dispatch and verify the separately stored record."""
     onboarding_id = str(record["_id"])
     operation = f"{onboarding_id}:{key}"
-    database.workflow_actions.update_one({"_id": operation}, {"$setOnInsert": {
+    await database.workflow_actions.upsert({"_id": operation}, {
         "onboarding_id": onboarding_id, "target": target, "state": "pending",
         "intent": expected, "created_at": now(),
-    }}, upsert=True)
-    database[target].update_one({"_id": record["_id"]}, {"$setOnInsert": {
+    })
+    await database[target].upsert({"_id": record["_id"]}, {
         **expected, "operation_id": operation, "created_at": now(),
-    }}, upsert=True)
-    observed = database[target].find_one({"_id": record["_id"]})
+    })
+    observed = await database[target].find_one({"_id": record["_id"]})
     if observed is None or observed.get("operation_id") != operation or any(
         observed.get(field) != value for field, value in expected.items()
     ):
-        database.workflow_actions.update_one({"_id": operation}, {"$set": {"state": "conflict"}})
+        await database.workflow_actions.update_one({"_id": operation}, {"$set": {"state": "conflict"}})
         raise HTTPException(409, "The sandbox record conflicts with the requested action.")
-    database.workflow_actions.update_one({"_id": operation}, {"$set": {
+    await database.workflow_actions.update_one({"_id": operation}, {"$set": {
         "state": "verified", "reference": onboarding_id,
         "evidence": "Read back the sandbox record and matched the operation and expected fields.",
         "verified_at": now(),
     }})
 
 
-def perform_stage_action(database, record):
+async def perform_stage_action(database, record):
     stage = record["stage"]
     if stage == 1:
-        sandbox_effect(database, record, "verify", "sandbox_verifications", {
+        await sandbox_effect(database, record, "verify", "sandbox_verifications", {
             "business_name": record["application"]["businessName"], "status": "reviewer_confirmed",
         })
     if stage == 5:
-        sandbox_effect(database, record, "prepare-agreement", "sandbox_documents", {
+        await sandbox_effect(database, record, "prepare-agreement", "sandbox_documents", {
             "content": (
                 f"Sandbox business banking agreement\n\n"
                 f"Business: {record['application']['businessName']}\n"
@@ -392,18 +376,18 @@ def perform_stage_action(database, record):
             ),
         })
     if stage == 8:
-        signature = database.sandbox_signatures.find_one({"_id": record["_id"]})
+        signature = await database.sandbox_signatures.find_one({"_id": record["_id"]})
         if signature is None:
             raise HTTPException(409, "A sandbox signature is required before provisioning.")
-        sandbox_effect(database, record, "provision", "sandbox_accounts", {
+        await sandbox_effect(database, record, "provision", "sandbox_accounts", {
             "reference": f"DEMO-{str(record['_id']).upper()}",
             "status": "active", "signer": signature["signer"],
         })
 
 
 @router.post("/admin/onboardings/{onboarding_id}/review")
-def review(onboarding_id: str, payload: Review, database: Db, actor: Admin):
-    record = case(database, onboarding_id)
+async def review(onboarding_id: str, payload: Review, database: Db, actor: Admin):
+    record = await case(database, onboarding_id)
     if record["revision"] != payload.revision:
         raise HTTPException(409, "This application changed. Reload and try again.")
     comments = payload.comments.strip()
@@ -419,7 +403,7 @@ def review(onboarding_id: str, payload: Review, database: Db, actor: Admin):
     if payload.risk:
         if stage not in {2, 4} or starting_status in {"PAUSED", "NEEDS_INFO"} or payload.decision == "cancel":
             raise HTTPException(409, "Risk can only be entered during risk assessment or risk review.")
-        rule = risk_policy(database, actor)
+        rule = await risk_policy(database, actor)
         risk = {
             **payload.risk.model_dump(), "policyVersion": rule["version"],
             "source": "bank_review", "reviewedAt": now(),
@@ -435,49 +419,39 @@ def review(onboarding_id: str, payload: Review, database: Db, actor: Admin):
         if stage in {1, 3, 6} and not comments:
             raise HTTPException(422, "Record what you reviewed before continuing.")
         if stage == 6:
-            if not database.sandbox_documents.find_one({"_id": record["_id"]}):
+            if not await database.sandbox_documents.find_one({"_id": record["_id"]}):
                 raise HTTPException(409, "Prepare the agreement before releasing it.")
             updates["documents_released"] = True
 
-    def persist(session):
-        # Serialize a transition with its sandbox dispatch on the case revision.
-        updated = change(database, session, record, updates, actor, "admin", payload.decision, comments)
-        if payload.risk and record.get("risk"):
-            if not comments:
-                raise HTTPException(422, "Explain why the recorded risk assessment is changing.")
-            override = ObjectId()
-            database.overrides.insert_one({
-                "_id": override, "onboarding_id": record["_id"], "before": record["risk"], "after": risk,
-                "reason": comments, "actor_id": actor, "created_at": now(),
-            }, session=session)
-        return updated
-
+    override = None
+    if payload.risk and record.get("risk"):
+        if not comments:
+            raise HTTPException(422, "Explain why the recorded risk assessment is changing.")
+        override = {
+            "id": str(ObjectId()), "before": record["risk"], "after": risk,
+            "reason": comments, "actor_id": str(actor), "created_at": now(),
+        }
     if payload.decision == "continue" and starting_status != "PAUSED" and stage in {1, 5, 8}:
-        def persist_with_effect(session):
-            updated = persist(session)
-            # Target and intent write independently so the next attempt can reconcile them.
-            perform_stage_action(database, record)
-            return updated
-
-        return admin_progress(transact(database, persist_with_effect))
-    return admin_progress(transact(database, persist))
+        await perform_stage_action(database, record)
+    updated = await change(database, record, updates, actor, "admin", payload.decision, comments, override)
+    return admin_progress(updated)
 
 
 @router.get("/admin/workflow/runs/{onboarding_id}")
-def workflow_run(onboarding_id: str, database: Db, actor: Admin):
-    record = case(database, onboarding_id)
+async def workflow_run(onboarding_id: str, database: Db, actor: Admin):
+    record = await case(database, onboarding_id)
     return {
         "status": case_status(record), "currentNode": STEPS[record["stage"]],
-        "checkpoint": record["revision"], "actions": action_trace(database, record),
+        "checkpoint": record["revision"], "actions": await action_trace(database, record),
     }
 
 
 @router.post("/admin/workflow/runs/{onboarding_id}/retry")
-def retry_workflow(onboarding_id: str, database: Db, actor: Admin):
-    record = case(database, onboarding_id)
+async def retry_workflow(onboarding_id: str, database: Db, actor: Admin):
+    record = await case(database, onboarding_id)
     if case_status(record) not in {"VERIFYING", "DOCUMENT_GENERATION", "PROVISIONING"}:
         raise HTTPException(409, "There is no sandbox action to retry at this step.")
-    return review(onboarding_id, Review(
+    return await review(onboarding_id, Review(
         revision=record["revision"], decision="continue", comments="Reconcile and retry sandbox action.",
     ), database, actor)
 
@@ -489,8 +463,8 @@ class Proposal(BaseModel):
 
 
 @router.get("/admin/guardrails")
-def guardrails(database: Db, actor: Admin):
-    active = database.guardrails.find_one({"_id": RISK_POLICY["key"]})
+async def guardrails(database: Db, actor: Admin):
+    active = await database.guardrails.find_one({"_id": RISK_POLICY["key"]})
     if not active:
         return [{
             "key": RISK_POLICY["key"], "activeVersion": 1,
@@ -500,55 +474,60 @@ def guardrails(database: Db, actor: Admin):
 
 
 @router.get("/admin/guardrail-proposals")
-def proposals(database: Db, actor: Admin):
+async def proposals(database: Db, actor: Admin):
     return [
         {**row, "id": str(row.pop("_id"))}
-        for row in database.guardrail_proposals.find({}, {"actor_id": 0}).sort("created_at", -1)
+        for row in await database.guardrail_proposals.find({}, projection={"actor_id": 0}, sort=("created_at", -1))
     ]
 
 
 @router.post("/admin/guardrail-proposals", status_code=201)
-def propose(payload: Proposal, database: Db, actor: Admin):
-    record = case(database, payload.onboardingId)
-    override = database.overrides.find_one({"onboarding_id": record["_id"]}, sort=[("created_at", -1)])
+async def propose(payload: Proposal, database: Db, actor: Admin):
+    record = await case(database, payload.onboardingId)
+    overrides = record.get("risk_overrides", [])
+    legacy = await database.overrides.find({"onboarding_id": record["_id"]}, sort=("created_at", -1))
+    override = overrides[-1] if overrides else legacy[0] if legacy else None
     if not override:
         raise HTTPException(422, "Record a risk override on this onboarding before proposing a guardrail.")
-    result = database.guardrail_proposals.insert_one({
+    result = await database.guardrail_proposals.insert_one({
         "rule": payload.rule, "reason": payload.reason, "status": "pending",
-        "override": {"id": str(override["_id"]), "reason": override["reason"], "caseId": payload.onboardingId},
+        "override": {"id": str(override.get("id") or override["_id"]), "reason": override["reason"], "caseId": payload.onboardingId},
         "actor_id": actor, "created_at": now(),
     })
     return {"id": str(result.inserted_id)}
 
 
 @router.post("/admin/guardrail-proposals/{proposal_id}/decision")
-def decide_proposal(proposal_id: str, payload: ProposalDecision, database: Db, actor: Admin):
+async def decide_proposal(proposal_id: str, payload: ProposalDecision, database: Db, actor: Admin):
     key = object_id(proposal_id)
 
-    def decide(session):
-        proposal = database.guardrail_proposals.find_one_and_update(
-            {"_id": key, "status": "pending"},
-            {"$set": {
-                "status": "approved" if payload.decision == "approve" else "rejected",
-                "decisionReason": payload.comments, "decidedBy": str(actor), "decidedAt": now(),
-            }},
-            return_document=ReturnDocument.AFTER, session=session,
-        )
-        if proposal is None:
-            raise HTTPException(409, "This proposal is no longer pending.")
-        if payload.decision == "approve":
-            baseline = {"version": 1, "rule": "High risk requires a documented reviewer decision."}
-            policy_id = RISK_POLICY["key"]
-            current = database.guardrails.find_one({"_id": policy_id}, session=session)
-            version = current["active_version"] + 1 if current else 2
-            versions = current["versions"] if current else [baseline]
-            database.guardrails.update_one({"_id": policy_id}, {"$set": {
-                "active_version": version,
-                "versions": [*versions, {
-                    "version": version, "rule": proposal["rule"], "proposalId": proposal_id,
-                    "approvedBy": str(actor), "approvedAt": now(),
-                }],
-            }}, upsert=True, session=session)
-        return {"status": proposal["status"]}
-
-    return transact(database, decide)
+    proposal = await database.guardrail_proposals.find_one({"_id": key})
+    if proposal is None or proposal["status"] != "pending":
+        raise HTTPException(409, "This proposal is no longer pending.")
+    policy_id = RISK_POLICY["key"]
+    current = await database.guardrails.find_one({"_id": policy_id})
+    versions = current["versions"] if current else [
+        {"version": 1, "rule": "High risk requires a documented reviewer decision."}
+    ]
+    published = next((version for version in versions if version.get("proposalId") == proposal_id), None)
+    if published and payload.decision == "reject":
+        raise HTTPException(409, "This policy version has already been published. Retry approval.")
+    if payload.decision == "approve" and not published:
+        version = versions[-1]["version"] + 1
+        fields = {
+            "active_version": version,
+            "versions": [*versions, {
+                "version": version, "rule": proposal["rule"], "proposalId": proposal_id,
+                "approvedBy": str(actor), "approvedAt": now(),
+            }],
+        }
+        if current:
+            await database.guardrails.update_one({"_id": policy_id}, {"$set": fields})
+        else:
+            await database.guardrails.upsert({"_id": policy_id}, fields)
+    decision = "approved" if payload.decision == "approve" else "rejected"
+    await database.guardrail_proposals.update_one({"_id": key, "status": "pending"}, {"$set": {
+        "status": decision, "decisionReason": payload.comments,
+        "decidedBy": str(actor), "decidedAt": now(),
+    }})
+    return {"status": decision}

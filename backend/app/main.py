@@ -13,13 +13,12 @@ from bson.errors import InvalidId
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from gridfs import GridFSBucket
-from gridfs.errors import NoFile
 from pydantic import BaseModel, Field
-from pymongo import MongoClient, ReturnDocument
-from pymongo.client_session import ClientSession
-from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
+
+from .mcp_database import MCPDatabase as Database, MCPBucket, NoFile, DuplicateKeyError, StorageError, tool
+from .mongodb_mcp import mongodb_mcp_session
 
 from .demo import _upsert_by_key, conversation_actor, get_database
 from .documents import document_response, store_upload, stream_document
@@ -31,6 +30,8 @@ load_dotenv(Path(__file__).resolve().parents[2] / "database" / ".env")
 logger = logging.getLogger(__name__)
 
 QUESTION_COUNT = len(QUESTIONS)
+
+
 class ConversationPayload(BaseModel):
     id: UUID
     startedAt: datetime
@@ -79,48 +80,58 @@ class DocumentResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    uri = os.environ.get("MONGODB_URI")
-    database_name = os.environ.get("MONGODB_DATABASE")
-    client = None
     app.state.database = None
-
-    if uri and database_name:
-        client = MongoClient(uri)
-        client.admin.command("ping")
-        app.state.database = client[database_name]
-
-    try:
-        yield
-    finally:
-        if client is not None:
-            client.close()
+    database_name = os.getenv("MONGODB_DATABASE")
+    project_id = os.getenv("MDB_MCP_PROJECT_ID")
+    cluster_name = os.getenv("MDB_MCP_CLUSTER_NAME")
+    if not database_name or not project_id or not cluster_name:
+        raise RuntimeError("Set MONGODB_DATABASE, MDB_MCP_PROJECT_ID and MDB_MCP_CLUSTER_NAME for Atlas Managed MCP.")
+    async with mongodb_mcp_session() as session:
+        connected = await tool(session, "remote-atlas-connect", {"projectId": project_id, "clusterName": cluster_name})
+        connection_id = connected.get("connectionId")
+        if not connection_id:
+            raise RuntimeError("Atlas Managed MCP returned no cluster connection ID.")
+        app.state.database = Database(session, connection_id, database_name)
+        try:
+            yield
+        finally:
+            app.state.database = None
 
 
 app = FastAPI(title="Customer 360 API", lifespan=lifespan)
 app.include_router(router)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")],
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")).split(",") if origin.strip()],
     allow_methods=["DELETE", "GET", "POST"],
     allow_headers=["Content-Type"],
     expose_headers=["X-Request-ID"],
 )
 
 
+@app.exception_handler(StorageError)
+async def storage_error_handler(request: Request, error: StorageError):
+    return JSONResponse(status_code=503, content={"detail": "Atlas MCP storage operation failed. Retry the request."})
+
+
 @app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    request_id = str(uuid4())
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
+async def storage_request(request: Request, call_next):
+    database = getattr(request.app.state, "database", None)
+    if database is None or request.url.path == "/api/v1/login":
+        response = await call_next(request)
+    else:
+        async with database.write_lock:
+            response = await call_next(request)
+    response.headers["X-Request-ID"] = str(uuid4())
     return response
 
 
-def _read_answers(
-    database: Database, conversation_id: ObjectId, session: ClientSession | None = None
+async def _read_answers(
+    database: Database, conversation_id: ObjectId
 ) -> list[str]:
-    messages = database["messages"].find(
-        {"conversation_id": conversation_id, "role": "user"}, session=session
-    ).sort("sequence", 1)
+    messages = await database["messages"].find(
+        {"conversation_id": conversation_id, "role": "user"}, sort=("sequence", 1)
+    )
     return [message["content"] for message in messages]
 
 
@@ -138,10 +149,10 @@ def _conversation_response(document: dict, answers: list[str]) -> ConversationRe
     )
 
 
-def _owned_conversation(
+async def _owned_conversation(
     database: Database, customer_id: ObjectId, conversation_id: UUID
 ) -> dict:
-    conversation = database["conversations"].find_one(
+    conversation = await database["conversations"].find_one(
         {"client_id": str(conversation_id), "customer_id": customer_id}
     )
     if conversation is None:
@@ -152,23 +163,21 @@ def _owned_conversation(
     return conversation
 
 
-def _save_answer(
+async def _save_answer(
     database: Database,
     conversation: dict,
     customer_id: ObjectId,
     sequence: int,
     content: str,
-    session: ClientSession | None = None,
 ) -> None:
-    onboarding = database.onboardings.find_one(
+    onboarding = await database.onboardings.find_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id},
-        session=session,
     )
     if onboarding is None or onboarding["status"] != "DRAFT":
         raise HTTPException(409, "This draft has already been submitted.")
     messages = database["messages"]
     query = {"conversation_id": conversation["_id"], "sequence": sequence}
-    existing = messages.find_one(query, session=session)
+    existing = await messages.find_one(query)
     if existing is not None:
         if existing["content"] != content:
             raise HTTPException(
@@ -176,8 +185,8 @@ def _save_answer(
                 detail="This answer sequence was already saved with different content.",
             )
     else:
-        current_count = messages.count_documents(
-            {"conversation_id": conversation["_id"], "role": "user"}, session=session
+        current_count = await messages.count_documents(
+            {"conversation_id": conversation["_id"], "role": "user"}
         )
         if sequence != current_count:
             raise HTTPException(
@@ -186,7 +195,7 @@ def _save_answer(
             )
         now = datetime.now(timezone.utc)
         try:
-            messages.insert_one(
+            await messages.insert_one(
                 {
                     "conversation_id": conversation["_id"],
                     "role": "user",
@@ -194,21 +203,18 @@ def _save_answer(
                     "sequence": sequence,
                     "created_at": now,
                 },
-                session=session,
             )
         except DuplicateKeyError:
-            if session is not None:
-                raise
-            existing = messages.find_one(query, session=session)
+            existing = await messages.find_one(query)
             if existing is None or existing["content"] != content:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="This answer sequence was already saved with different content.",
                 ) from None
 
-    answers = _read_answers(database, conversation["_id"], session)
+    answers = await _read_answers(database, conversation["_id"])
     now = datetime.now(timezone.utc)
-    database["onboardings"].update_one(
+    await database["onboardings"].update_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id, "status": "DRAFT"},
         {
             "$set": {
@@ -218,9 +224,8 @@ def _save_answer(
                 "updated_at": now,
             }
         },
-        session=session,
     )
-    database["conversations"].update_one(
+    await database["conversations"].update_one(
         {"_id": conversation["_id"]},
         {
             "$set": {
@@ -228,7 +233,6 @@ def _save_answer(
                 "updated_at": now,
             }
         },
-        session=session,
     )
 
 
@@ -239,16 +243,14 @@ async def login() -> bool:
 
 
 @app.get("/api/v1/conversations", response_model=list[ConversationResponse])
-def list_conversations(request: Request):
+async def list_conversations(request: Request):
     database = get_database(request)
-    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
-    conversations = database["conversations"].find(
-        {"customer_id": customer_id}
-    ).sort("updated_at", -1)
+    customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
+    conversations = await database["conversations"].find(
+        {"customer_id": customer_id}, sort=("updated_at", -1)
+    )
     return [
-        _conversation_response(
-            conversation, _read_answers(database, conversation["_id"])
-        )
+        await _chat_response(database, conversation, customer_id)
         for conversation in conversations
     ]
 
@@ -258,15 +260,15 @@ def list_conversations(request: Request):
     response_model=ConversationResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_conversation(payload: ConversationPayload, request: Request):
+async def create_conversation(payload: ConversationPayload, request: Request):
     database = get_database(request)
-    customer_id, user_id = conversation_actor(database, request.query_params.get("customer_id"))
+    customer_id, user_id = await conversation_actor(database, request.query_params.get("customer_id"))
     client_id = str(payload.id)
     started_at = payload.startedAt
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
     started_at = started_at.astimezone(timezone.utc)
-    onboarding = _upsert_by_key(
+    onboarding = await _upsert_by_key(
         database["onboardings"],
         {"client_id": client_id, "customer_id": customer_id},
         {
@@ -280,7 +282,7 @@ def create_conversation(payload: ConversationPayload, request: Request):
             "requested_products": [],
         },
     )
-    conversation = _upsert_by_key(
+    conversation = await _upsert_by_key(
         database["conversations"],
         {"client_id": client_id, "customer_id": customer_id},
         {
@@ -293,9 +295,9 @@ def create_conversation(payload: ConversationPayload, request: Request):
         },
     )
     for sequence, answer in enumerate(payload.answers):
-        _save_answer(database, conversation, customer_id, sequence, answer)
+        await _save_answer(database, conversation, customer_id, sequence, answer)
     return _conversation_response(
-        conversation, _read_answers(database, conversation["_id"])
+        conversation, await _read_answers(database, conversation["_id"])
     )
 
 
@@ -303,12 +305,12 @@ def create_conversation(payload: ConversationPayload, request: Request):
     "/api/v1/conversations/{conversation_id}/answers",
     response_model=ConversationResponse,
 )
-def save_conversation_answer(
+async def save_conversation_answer(
     conversation_id: UUID, payload: AnswerPayload, request: Request
 ):
     database = get_database(request)
-    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
-    conversation = database["conversations"].find_one(
+    customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
+    conversation = await database["conversations"].find_one(
         {"client_id": str(conversation_id), "customer_id": customer_id}
     )
     if conversation is None:
@@ -322,19 +324,33 @@ def save_conversation_answer(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Answer cannot be blank.",
         )
-    _save_answer(
+    await _save_answer(
         database, conversation, customer_id, payload.sequence, content
     )
     return _conversation_response(
-        conversation, _read_answers(database, conversation["_id"])
+        conversation, await _read_answers(database, conversation["_id"])
     )
 
 
+async def _chat_response(database, conversation, customer_id):
+    if not conversation.get("application_submitted"):
+        onboarding = await database.onboardings.find_one({"_id": conversation["onboarding_id"]})
+        if onboarding and onboarding["status"] != "DRAFT":
+            conversation = {**conversation, "application_submitted": True}
+        elif turn := conversation.get("pending_answer"):
+            await _save_answer(database, conversation, customer_id, turn["sequence"], turn["answer"])
+            await database.conversations.update_one(
+                {"_id": conversation["_id"]}, {"$unset": {"pending_answer": ""}},
+            )
+    answers = await _read_answers(database, conversation["_id"])
+    return _conversation_response(conversation, answers)
+
+
 @app.post("/api/v1/conversations/{conversation_id}/chat", response_model=ConversationResponse)
-def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Request):
+async def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Request):
     database = get_database(request)
-    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
-    conversation = _owned_conversation(database, customer_id, conversation_id)
+    customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
+    conversation = await _owned_conversation(database, customer_id, conversation_id)
     content = payload.content.strip()
     if not content:
         raise HTTPException(status_code=422, detail="Enter a message before sending.")
@@ -351,10 +367,10 @@ def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Requ
             raise HTTPException(status_code=409, detail="This conversation changed. Reload it and try again.")
         return True
 
-    answers = _read_answers(database, conversation["_id"])
-    if not current_turn(conversation, answers):
-        return _conversation_response(conversation, answers)
-    if conversation.get("application_submitted"):
+    response = await _chat_response(database, conversation, customer_id)
+    if not current_turn(conversation, response.answers):
+        return response
+    if response.applicationId:
         raise HTTPException(409, "This draft has already been submitted.")
 
     recent_turns = [
@@ -363,7 +379,7 @@ def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Requ
         if turn["sequence"] == payload.sequence
     ][-5:]
     try:
-        decision = interpret_answer(payload.sequence, content, recent_turns)
+        decision = await run_in_threadpool(interpret_answer, payload.sequence, content, recent_turns)
     except Exception as error:
         logger.warning("Onboarding guide failed (%s)", type(error).__name__)
         raise HTTPException(
@@ -371,56 +387,43 @@ def send_chat_message(conversation_id: UUID, payload: ChatPayload, request: Requ
             detail="The onboarding guide is unavailable. Your message can be retried.",
         ) from None
 
-    def persist(session: ClientSession):
-        latest = database.conversations.find_one({"_id": conversation["_id"]}, session=session)
-        if latest is None:
-            raise HTTPException(status_code=404, detail="Conversation not found.")
-        latest_answers = _read_answers(database, latest["_id"], session)
-        if not current_turn(latest, latest_answers):
-            return _conversation_response(latest, latest_answers)
-        if latest.get("application_submitted"):
-            raise HTTPException(409, "This draft has already been submitted.")
-
-        saved = database.conversations.find_one_and_update(
-            {"_id": latest["_id"]},
-            {
-                "$inc": {"chat_revision": 1},
-                "$set": {"updated_at": datetime.now(timezone.utc)},
-                "$push": {
-                    "chat_turns": {
-                        "$each": [{
-                            "id": turn_id,
-                            "sequence": payload.sequence,
-                            "content": content,
-                            "clarification": decision.reply,
-                        }],
-                        "$slice": -50,
-                    },
+    await database.conversations.update_one(
+        {"_id": conversation["_id"]},
+        {
+            "$inc": {"chat_revision": 1},
+            "$set": {
+                "updated_at": datetime.now(timezone.utc),
+                **({"pending_answer": {"answer": decision.answer, "sequence": payload.sequence}}
+                   if decision.action == "accept" else {}),
+            },
+            "$push": {
+                "chat_turns": {
+                    "$each": [{
+                        "id": turn_id,
+                        "sequence": payload.sequence,
+                        "content": content,
+                        "clarification": decision.reply,
+                    }],
+                    "$slice": -50,
                 },
             },
-            return_document=ReturnDocument.AFTER,
-            session=session,
-        )
-        if decision.action == "accept":
-            _save_answer(database, saved, customer_id, payload.sequence, decision.answer, session)
-            latest_answers.append(decision.answer)
-        return _conversation_response(saved, latest_answers)
-
-    with database.client.start_session() as session:
-        return session.with_transaction(persist)
+        },
+    )
+    saved = await database.conversations.find_one({"_id": conversation["_id"]})
+    return await _chat_response(database, saved, customer_id)
 
 
 @app.get(
     "/api/v1/conversations/{conversation_id}/documents",
     response_model=list[DocumentResponse],
 )
-def list_documents(conversation_id: UUID, request: Request):
+async def list_documents(conversation_id: UUID, request: Request):
     database = get_database(request)
-    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
-    conversation = _owned_conversation(database, customer_id, conversation_id)
-    documents = database["documents"].find(
-        {"customer_id": customer_id, "conversation_id": conversation["_id"]}
-    ).sort("created_at", 1)
+    customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
+    conversation = await _owned_conversation(database, customer_id, conversation_id)
+    documents = await database["documents"].find(
+        {"customer_id": customer_id, "conversation_id": conversation["_id"]}, sort=("created_at", 1)
+    )
     return [document_response(document) for document in documents]
 
 
@@ -429,21 +432,21 @@ def list_documents(conversation_id: UUID, request: Request):
     response_model=DocumentResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def upload_document(
+async def upload_document(
     conversation_id: UUID,
     request: Request,
     file: UploadFile = File(...),
 ):
     database = get_database(request)
-    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
-    conversation = _owned_conversation(database, customer_id, conversation_id)
-    return store_upload(database, customer_id, conversation["onboarding_id"], file, conversation["_id"])
+    customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
+    conversation = await _owned_conversation(database, customer_id, conversation_id)
+    return await store_upload(database, customer_id, conversation["onboarding_id"], file, conversation["_id"])
 
 
 @app.get("/api/v1/documents/{document_id}/download")
-def download_document(document_id: str, request: Request):
+async def download_document(document_id: str, request: Request):
     database = get_database(request)
-    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
+    customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
     try:
         object_id = ObjectId(document_id)
     except InvalidId:
@@ -451,7 +454,7 @@ def download_document(document_id: str, request: Request):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found.",
         ) from None
-    document = database["documents"].find_one(
+    document = await database["documents"].find_one(
         {"_id": object_id, "customer_id": customer_id}
     )
     if document is None:
@@ -459,13 +462,13 @@ def download_document(document_id: str, request: Request):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found.",
         )
-    return stream_document(database, document)
+    return await stream_document(database, document)
 
 @app.delete("/api/v1/conversations/{conversation_id}/documents/{document_id}")
-def delete_document(conversation_id: UUID, document_id: str, request: Request):
+async def delete_document(conversation_id: UUID, document_id: str, request: Request):
     database = get_database(request)
-    customer_id, _ = conversation_actor(database, request.query_params.get("customer_id"))
-    conversation = _owned_conversation(database, customer_id, conversation_id)
+    customer_id, _ = await conversation_actor(database, request.query_params.get("customer_id"))
+    conversation = await _owned_conversation(database, customer_id, conversation_id)
     try:
         object_id = ObjectId(document_id)
     except InvalidId:
@@ -473,7 +476,7 @@ def delete_document(conversation_id: UUID, document_id: str, request: Request):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found.",
         ) from None
-    document = database["documents"].find_one(
+    document = await database["documents"].find_one(
         {
             "_id": object_id,
             "customer_id": customer_id,
@@ -487,11 +490,11 @@ def delete_document(conversation_id: UUID, document_id: str, request: Request):
         )
 
     try:
-        GridFSBucket(database).delete(document["storage_id"])
+        await MCPBucket(database).delete(document["storage_id"])
     except NoFile:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document content not found.",
         ) from None
-    database["documents"].delete_one({"_id": object_id})
+    await database["documents"].delete_one({"_id": object_id})
     return {"deleted": True}

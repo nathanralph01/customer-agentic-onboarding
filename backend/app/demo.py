@@ -5,10 +5,7 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import HTTPException, Request, status
-from pymongo import ReturnDocument
-from pymongo.collection import Collection
-from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError
+from .mcp_database import MCPCollection as Collection, MCPDatabase as Database
 
 DEMO_CUSTOMER_NAME = "Northstar Test Goods Ltd."
 DEMO_USER_EMAIL = "customer.demo@customer360.example"
@@ -23,26 +20,13 @@ def get_database(request: Request) -> Database:
     return database
 
 
-def _upsert_by_key(
-    collection: Collection, key: dict, insert_fields: dict
-) -> dict:
-    try:
-        return collection.find_one_and_update(
-            key,
-            {"$setOnInsert": insert_fields},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-    except DuplicateKeyError:
-        existing = collection.find_one(key)
-        if existing is None:
-            raise
-        return existing
+async def _upsert_by_key(collection: Collection, key: dict, insert_fields: dict) -> dict:
+    return await collection.upsert(key, insert_fields)
 
 
-def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
+async def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
     now = datetime.now(timezone.utc)
-    customer = _upsert_by_key(
+    customer = await _upsert_by_key(
         database["customers"],
         {"legal_name": DEMO_CUSTOMER_NAME},
         {
@@ -54,7 +38,7 @@ def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
             "owners": [],
         },
     )
-    user = _upsert_by_key(
+    user = await _upsert_by_key(
         database["users"],
         {"email": DEMO_USER_EMAIL},
         {
@@ -81,21 +65,21 @@ def object_id(value: str) -> ObjectId:
         raise HTTPException(status_code=404, detail="Record not found.") from None
 
 
-def get_actor(database: Database, role: str, actor_id: str | None) -> ObjectId:
+async def get_actor(database: Database, role: str, actor_id: str | None) -> ObjectId:
     query = {"role": role}
     if actor_id is not None:
         query["_id"] = object_id(actor_id)
-    actor = database.users.find_one(query)
+    actor = await database.users.find_one(query)
     if actor is None:
         raise HTTPException(status_code=404, detail="Demo persona not found.")
     return actor["_id"]
 
 
-def conversation_actor(database: Database, customer_id: str | None) -> tuple[ObjectId, ObjectId]:
+async def conversation_actor(database: Database, customer_id: str | None) -> tuple[ObjectId, ObjectId]:
     if customer_id is None:
-        return ensure_demo_profile(database)
+        return await ensure_demo_profile(database)
     customer = object_id(customer_id)
-    user = database.users.find_one({"role": "customer", "customer_id": customer})
+    user = await database.users.find_one({"role": "customer", "customer_id": customer})
     if user is None:
         raise HTTPException(status_code=404, detail="Demo customer not found.")
     return customer, user["_id"]

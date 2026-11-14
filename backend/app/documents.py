@@ -6,11 +6,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import HTTPException, UploadFile, status
-from fastapi.responses import StreamingResponse
-from gridfs import GridFSBucket
-from gridfs.errors import NoFile
-from pymongo.database import Database
-from pymongo.errors import PyMongoError
+from fastapi.responses import Response
+
+from .mcp_database import MCPBucket, MCPDatabase as Database, NoFile, StorageError
 
 MAX_DOCUMENT_SIZE = 10 * 1024 * 1024
 MAX_DOCUMENTS_PER_CONVERSATION = 10
@@ -36,8 +34,8 @@ def document_response(document: dict):
     )
 
 
-def store_upload(database: Database, customer_id, onboarding_id, file: UploadFile, conversation_id=None):
-    count = database["documents"].count_documents(
+async def store_upload(database: Database, customer_id, onboarding_id, file: UploadFile, conversation_id=None):
+    count = await database["documents"].count_documents(
         {"customer_id": customer_id, "onboarding_id": onboarding_id, "source": "uploaded"}
     )
     if count >= MAX_DOCUMENTS_PER_CONVERSATION:
@@ -53,7 +51,7 @@ def store_upload(database: Database, customer_id, onboarding_id, file: UploadFil
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail="Choose a PDF, DOCX, TXT, CSV, PNG or JPG file.",
         )
-    content = file.file.read(MAX_DOCUMENT_SIZE + 1)
+    content = await file.read(MAX_DOCUMENT_SIZE + 1)
     if not content:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -67,8 +65,8 @@ def store_upload(database: Database, customer_id, onboarding_id, file: UploadFil
 
     now = datetime.now(timezone.utc)
     content_type = guess_type(filename)[0] or "application/octet-stream"
-    bucket = GridFSBucket(database)
-    storage_id = bucket.upload_from_stream(
+    bucket = MCPBucket(database)
+    storage_id = await bucket.upload_from_stream(
         filename,
         content,
         metadata={
@@ -91,32 +89,25 @@ def store_upload(database: Database, customer_id, onboarding_id, file: UploadFil
         "source": "uploaded",
     }
     try:
-        result = database["documents"].insert_one(document)
-    except PyMongoError:
-        bucket.delete(storage_id)
+        result = await database["documents"].insert_one(document)
+    except StorageError:
+        await bucket.delete(storage_id, missing_ok=True)
         raise
     document["_id"] = result.inserted_id
     return document_response(document)
 
 
-def stream_document(database: Database, document):
+async def stream_document(database: Database, document):
     try:
-        stream = GridFSBucket(database).open_download_stream(document["storage_id"])
+        content = await MCPBucket(database).read(document["storage_id"])
     except NoFile:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document content not found.",
         ) from None
 
-    def content_chunks():
-        try:
-            while chunk := stream.read(64 * 1024):
-                yield chunk
-        finally:
-            stream.close()
-
-    return StreamingResponse(
-        content_chunks(),
+    return Response(
+        content,
         media_type=document["content_type"],
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(document['filename'])}"
