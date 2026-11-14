@@ -14,14 +14,19 @@ from bson.errors import InvalidId
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from gridfs import GridFSBucket
-from gridfs.errors import NoFile
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from pymongo import MongoClient, ReturnDocument
-from pymongo.collection import Collection
-from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError, PyMongoError
+
+from app.mcp_database import (
+    MCPDatabase as Database,
+    MCPCollection as Collection,
+    MCPBucket,
+    NoFile,
+    DuplicateKeyError,
+    StorageError,
+    tool,
+)
+from app.mongodb_mcp import mongodb_mcp_session
 
 load_dotenv(Path(__file__).resolve().parents[2] / "database" / ".env")
 
@@ -68,30 +73,45 @@ class DocumentResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    uri = os.environ.get("MONGODB_URI")
-    database_name = os.environ.get("MONGODB_DATABASE")
-    client = None
     app.state.database = None
-
-    if uri and database_name:
-        client = MongoClient(uri)
-        client.admin.command("ping")
-        app.state.database = client[database_name]
-
-    try:
-        yield
-    finally:
-        if client is not None:
-            client.close()
+    database_name = os.getenv("MONGODB_DATABASE")
+    project_id = os.getenv("MDB_MCP_PROJECT_ID")
+    cluster_name = os.getenv("MDB_MCP_CLUSTER_NAME")
+    if not database_name or not project_id or not cluster_name:
+        raise RuntimeError("Set MONGODB_DATABASE, MDB_MCP_PROJECT_ID and MDB_MCP_CLUSTER_NAME for Atlas Managed MCP.")
+    async with mongodb_mcp_session() as session:
+        connected = await tool(session, "remote-atlas-connect", {"projectId": project_id, "clusterName": cluster_name})
+        connection_id = connected.get("connectionId")
+        if not connection_id:
+            raise RuntimeError("Atlas Managed MCP returned no cluster connection ID.")
+        app.state.database = Database(session, connection_id, database_name)
+        try:
+            yield
+        finally:
+            app.state.database = None
 
 
 app = FastAPI(title="Customer 360 API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")],
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")).split(",") if origin.strip()],
     allow_methods=["DELETE", "GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+@app.exception_handler(StorageError)
+async def storage_error_handler(request: Request, error: StorageError):
+    return JSONResponse(status_code=503, content={"detail": "Atlas MCP storage operation failed. Retry the request."})
+
+
+@app.middleware("http")
+async def serialize_storage_requests(request: Request, call_next):
+    database = getattr(app.state, "database", None)
+    if database is None or request.url.path == "/api/v1/login":
+        return await call_next(request)
+    async with database.write_lock:
+        return await call_next(request)
 
 
 def get_database(request: Request) -> Database:
@@ -99,31 +119,18 @@ def get_database(request: Request) -> Database:
     if database is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Atlas is not configured. Set MONGODB_URI and MONGODB_DATABASE.",
+            detail="Atlas Managed MCP is not connected. Check the server configuration.",
         )
     return database
 
 
-def _upsert_by_key(
-    collection: Collection, key: dict, insert_fields: dict
-) -> dict:
-    try:
-        return collection.find_one_and_update(
-            key,
-            {"$setOnInsert": insert_fields},
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-    except DuplicateKeyError:
-        existing = collection.find_one(key)
-        if existing is None:
-            raise
-        return existing
+async def _upsert_by_key(collection: Collection, key: dict, insert_fields: dict) -> dict:
+    return await collection.upsert(key, insert_fields)
 
 
-def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
+async def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
     now = datetime.now(timezone.utc)
-    customer = _upsert_by_key(
+    customer = await _upsert_by_key(
         database["customers"],
         {"legal_name": DEMO_CUSTOMER_NAME},
         {
@@ -135,7 +142,7 @@ def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
             "owners": [],
         },
     )
-    user = _upsert_by_key(
+    user = await _upsert_by_key(
         database["users"],
         {"email": DEMO_USER_EMAIL},
         {
@@ -155,10 +162,10 @@ def ensure_demo_profile(database: Database) -> tuple[ObjectId, ObjectId]:
     return customer["_id"], user["_id"]
 
 
-def _read_answers(database: Database, conversation_id: ObjectId) -> list[str]:
-    messages = database["messages"].find(
-        {"conversation_id": conversation_id, "role": "user"}
-    ).sort("sequence", 1)
+async def _read_answers(database: Database, conversation_id: ObjectId) -> list[str]:
+    messages = await database["messages"].find(
+        {"conversation_id": conversation_id, "role": "user"}, sort=("sequence", 1)
+    )
     return [message["content"] for message in messages]
 
 
@@ -180,10 +187,10 @@ def _document_response(document: dict) -> DocumentResponse:
     )
 
 
-def _owned_conversation(
+async def _owned_conversation(
     database: Database, customer_id: ObjectId, conversation_id: UUID
 ) -> dict:
-    conversation = database["conversations"].find_one(
+    conversation = await database["conversations"].find_one(
         {"client_id": str(conversation_id), "customer_id": customer_id}
     )
     if conversation is None:
@@ -194,7 +201,7 @@ def _owned_conversation(
     return conversation
 
 
-def _save_answer(
+async def _save_answer(
     database: Database,
     conversation: dict,
     customer_id: ObjectId,
@@ -203,7 +210,7 @@ def _save_answer(
 ) -> None:
     messages = database["messages"]
     query = {"conversation_id": conversation["_id"], "sequence": sequence}
-    existing = messages.find_one(query)
+    existing = await messages.find_one(query)
     if existing is not None:
         if existing["content"] != content:
             raise HTTPException(
@@ -211,7 +218,7 @@ def _save_answer(
                 detail="This answer sequence was already saved with different content.",
             )
     else:
-        current_count = messages.count_documents(
+        current_count = await messages.count_documents(
             {"conversation_id": conversation["_id"], "role": "user"}
         )
         if sequence != current_count:
@@ -221,7 +228,7 @@ def _save_answer(
             )
         now = datetime.now(timezone.utc)
         try:
-            messages.insert_one(
+            await messages.insert_one(
                 {
                     "conversation_id": conversation["_id"],
                     "role": "user",
@@ -231,16 +238,16 @@ def _save_answer(
                 }
             )
         except DuplicateKeyError:
-            existing = messages.find_one(query)
+            existing = await messages.find_one(query)
             if existing is None or existing["content"] != content:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="This answer sequence was already saved with different content.",
                 ) from None
 
-    answers = _read_answers(database, conversation["_id"])
+    answers = await _read_answers(database, conversation["_id"])
     now = datetime.now(timezone.utc)
-    database["onboardings"].update_one(
+    await database["onboardings"].update_one(
         {"_id": conversation["onboarding_id"], "customer_id": customer_id},
         {
             "$set": {
@@ -251,7 +258,7 @@ def _save_answer(
             }
         },
     )
-    database["conversations"].update_one(
+    await database["conversations"].update_one(
         {"_id": conversation["_id"]},
         {
             "$set": {
@@ -269,15 +276,15 @@ async def login() -> bool:
 
 
 @app.get("/api/v1/conversations", response_model=list[ConversationResponse])
-def list_conversations(request: Request):
+async def list_conversations(request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
-    conversations = database["conversations"].find(
-        {"customer_id": customer_id}
-    ).sort("updated_at", -1)
+    customer_id, _ = await ensure_demo_profile(database)
+    conversations = await database["conversations"].find(
+        {"customer_id": customer_id}, sort=("updated_at", -1)
+    )
     return [
         _conversation_response(
-            conversation, _read_answers(database, conversation["_id"])
+            conversation, await _read_answers(database, conversation["_id"])
         )
         for conversation in conversations
     ]
@@ -288,15 +295,15 @@ def list_conversations(request: Request):
     response_model=ConversationResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_conversation(payload: ConversationPayload, request: Request):
+async def create_conversation(payload: ConversationPayload, request: Request):
     database = get_database(request)
-    customer_id, user_id = ensure_demo_profile(database)
+    customer_id, user_id = await ensure_demo_profile(database)
     client_id = str(payload.id)
     started_at = payload.startedAt
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=timezone.utc)
     started_at = started_at.astimezone(timezone.utc)
-    onboarding = _upsert_by_key(
+    onboarding = await _upsert_by_key(
         database["onboardings"],
         {"client_id": client_id, "customer_id": customer_id},
         {
@@ -310,7 +317,7 @@ def create_conversation(payload: ConversationPayload, request: Request):
             "requested_products": [],
         },
     )
-    conversation = _upsert_by_key(
+    conversation = await _upsert_by_key(
         database["conversations"],
         {"client_id": client_id, "customer_id": customer_id},
         {
@@ -323,9 +330,9 @@ def create_conversation(payload: ConversationPayload, request: Request):
         },
     )
     for sequence, answer in enumerate(payload.answers):
-        _save_answer(database, conversation, customer_id, sequence, answer)
+        await _save_answer(database, conversation, customer_id, sequence, answer)
     return _conversation_response(
-        conversation, _read_answers(database, conversation["_id"])
+        conversation, await _read_answers(database, conversation["_id"])
     )
 
 
@@ -333,12 +340,12 @@ def create_conversation(payload: ConversationPayload, request: Request):
     "/api/v1/conversations/{conversation_id}/answers",
     response_model=ConversationResponse,
 )
-def save_conversation_answer(
+async def save_conversation_answer(
     conversation_id: UUID, payload: AnswerPayload, request: Request
 ):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
-    conversation = database["conversations"].find_one(
+    customer_id, _ = await ensure_demo_profile(database)
+    conversation = await database["conversations"].find_one(
         {"client_id": str(conversation_id), "customer_id": customer_id}
     )
     if conversation is None:
@@ -352,11 +359,11 @@ def save_conversation_answer(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Answer cannot be blank.",
         )
-    _save_answer(
+    await _save_answer(
         database, conversation, customer_id, payload.sequence, content
     )
     return _conversation_response(
-        conversation, _read_answers(database, conversation["_id"])
+        conversation, await _read_answers(database, conversation["_id"])
     )
 
 
@@ -364,13 +371,13 @@ def save_conversation_answer(
     "/api/v1/conversations/{conversation_id}/documents",
     response_model=list[DocumentResponse],
 )
-def list_documents(conversation_id: UUID, request: Request):
+async def list_documents(conversation_id: UUID, request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
-    conversation = _owned_conversation(database, customer_id, conversation_id)
-    documents = database["documents"].find(
-        {"customer_id": customer_id, "conversation_id": conversation["_id"]}
-    ).sort("created_at", 1)
+    customer_id, _ = await ensure_demo_profile(database)
+    conversation = await _owned_conversation(database, customer_id, conversation_id)
+    documents = await database["documents"].find(
+        {"customer_id": customer_id, "conversation_id": conversation["_id"]}, sort=("created_at", 1)
+    )
     return [_document_response(document) for document in documents]
 
 
@@ -379,15 +386,15 @@ def list_documents(conversation_id: UUID, request: Request):
     response_model=DocumentResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def upload_document(
+async def upload_document(
     conversation_id: UUID,
     request: Request,
     file: UploadFile = File(...),
 ):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
-    conversation = _owned_conversation(database, customer_id, conversation_id)
-    count = database["documents"].count_documents(
+    customer_id, _ = await ensure_demo_profile(database)
+    conversation = await _owned_conversation(database, customer_id, conversation_id)
+    count = await database["documents"].count_documents(
         {"customer_id": customer_id, "conversation_id": conversation["_id"]}
     )
     if count >= MAX_DOCUMENTS_PER_CONVERSATION:
@@ -403,7 +410,7 @@ def upload_document(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail="Choose a PDF, DOCX, TXT, CSV, PNG or JPG file.",
         )
-    content = file.file.read(MAX_DOCUMENT_SIZE + 1)
+    content = await file.read(MAX_DOCUMENT_SIZE + 1)
     if not content:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -417,8 +424,8 @@ def upload_document(
 
     now = datetime.now(timezone.utc)
     content_type = guess_type(filename)[0] or "application/octet-stream"
-    bucket = GridFSBucket(database)
-    storage_id = bucket.upload_from_stream(
+    bucket = MCPBucket(database)
+    storage_id = await bucket.upload_from_stream(
         filename,
         content,
         metadata={
@@ -441,18 +448,18 @@ def upload_document(
         "source": "uploaded",
     }
     try:
-        result = database["documents"].insert_one(document)
-    except PyMongoError:
-        bucket.delete(storage_id)
+        result = await database["documents"].insert_one(document)
+    except StorageError:
+        await bucket.delete(storage_id)
         raise
     document["_id"] = result.inserted_id
     return _document_response(document)
 
 
 @app.get("/api/v1/documents/{document_id}/download")
-def download_document(document_id: str, request: Request):
+async def download_document(document_id: str, request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
+    customer_id, _ = await ensure_demo_profile(database)
     try:
         object_id = ObjectId(document_id)
     except InvalidId:
@@ -460,7 +467,7 @@ def download_document(document_id: str, request: Request):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found.",
         ) from None
-    document = database["documents"].find_one(
+    document = await database["documents"].find_one(
         {"_id": object_id, "customer_id": customer_id}
     )
     if document is None:
@@ -469,22 +476,15 @@ def download_document(document_id: str, request: Request):
             detail="Document not found.",
         )
     try:
-        stream = GridFSBucket(database).open_download_stream(document["storage_id"])
+        content = await MCPBucket(database).read(document["storage_id"])
     except NoFile:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document content not found.",
         ) from None
 
-    def content_chunks():
-        try:
-            while chunk := stream.read(64 * 1024):
-                yield chunk
-        finally:
-            stream.close()
-
     return StreamingResponse(
-        content_chunks(),
+        iter([content]),
         media_type=document["content_type"],
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(document['filename'])}"
@@ -493,10 +493,10 @@ def download_document(document_id: str, request: Request):
 
 
 @app.delete("/api/v1/conversations/{conversation_id}/documents/{document_id}")
-def delete_document(conversation_id: UUID, document_id: str, request: Request):
+async def delete_document(conversation_id: UUID, document_id: str, request: Request):
     database = get_database(request)
-    customer_id, _ = ensure_demo_profile(database)
-    conversation = _owned_conversation(database, customer_id, conversation_id)
+    customer_id, _ = await ensure_demo_profile(database)
+    conversation = await _owned_conversation(database, customer_id, conversation_id)
     try:
         object_id = ObjectId(document_id)
     except InvalidId:
@@ -504,7 +504,7 @@ def delete_document(conversation_id: UUID, document_id: str, request: Request):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document not found.",
         ) from None
-    document = database["documents"].find_one(
+    document = await database["documents"].find_one(
         {
             "_id": object_id,
             "customer_id": customer_id,
@@ -518,11 +518,11 @@ def delete_document(conversation_id: UUID, document_id: str, request: Request):
         )
 
     try:
-        GridFSBucket(database).delete(document["storage_id"])
+        await MCPBucket(database).delete(document["storage_id"], missing_ok=True)
     except NoFile:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Document content not found.",
         ) from None
-    database["documents"].delete_one({"_id": object_id})
+    await database["documents"].delete_one({"_id": object_id})
     return {"deleted": True}
